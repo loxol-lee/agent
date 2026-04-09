@@ -35,6 +35,7 @@ jobs:
           fi
 
       - name: Run quality gate contract tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}/apps/server/src
-        run: python -m unittest -v test_quality_gate_contract
+        run: |
+          cd "$GITHUB_WORKSPACE/apps/server/src"
+          export PYTHONPATH="$GITHUB_WORKSPACE/apps/server/src"
+          python -m unittest -v test_quality_gate_contract
