@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+from core.contracts.observability import Span, Trace
+
+
+class Storage(Protocol):
+    def insert_trace(self, trace: Trace) -> None: ...
+
+    def finish_trace(
+        self,
+        trace_id: str,
+        finished_at_ms: int,
+        status: str,
+        stop_reason: str | None,
+        error_message: str | None,
+    ) -> None: ...
+
+    def insert_span(self, span: Span) -> None: ...
+
+    def insert_message(self, conversation_id: str, trace_id: str, role: str, content: str) -> None: ...
+
+    def list_chat_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, str]]: ...
+
+    def insert_memory(self, conversation_id: str, trace_id: str, content: str) -> None: ...
+
+    def list_memories(self, conversation_id: str, limit: int = 10) -> list[dict]: ...
+
+    def delete_memories(self, conversation_id: str, memory_ids: list[int]) -> int: ...
+
+    def get_memory_write_enabled(self, conversation_id: str) -> bool: ...
+
+    def set_memory_write_enabled(self, conversation_id: str, enabled: bool) -> None: ...
+
+    def insert_tool_run(
+        self,
+        *,
+        trace_id: str,
+        conversation_id: str,
+        call_id: str,
+        tool_name: str,
+        allowed: bool,
+        risk: str,
+        side_effect: bool,
+        args_json: str,
+        result_json: str,
+        ok: bool,
+        error_code: str | None,
+        error_message: str | None,
+        started_at_ms: int,
+        finished_at_ms: int,
+    ) -> None: ...
+
+    def insert_replay_event(self, trace_id: str, seq: int, type_: str, payload_json: str) -> None: ...
+
+    def get_trace(self, trace_id: str) -> dict | None: ...
+
+    def list_spans(self, trace_id: str) -> list[dict]: ...
+
+    def list_replay_events(self, trace_id: str, limit: int = 2000) -> list[dict]: ...
+
+    def list_tool_runs(self, trace_id: str, limit: int = 200) -> list[dict]: ...
+
+    def list_messages(self, conversation_id: str, limit: int = 50) -> list[dict]: ...
+
+    def list_conversations(self, limit: int = 50) -> list[dict]: ...
+
+    def rename_conversation(self, conversation_id: str, title: str) -> None: ...
+
+    def archive_conversation(self, conversation_id: str) -> None: ...
+
+    def purge_conversation(self, conversation_id: str) -> None: ...
+
+    def purge_all_conversations(self) -> None: ...
