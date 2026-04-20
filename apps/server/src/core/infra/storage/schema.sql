@@ -97,3 +97,45 @@ CREATE TABLE IF NOT EXISTS tool_runs (
 
 CREATE INDEX IF NOT EXISTS idx_tool_runs_trace_id ON tool_runs(trace_id);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_conversation_id_created_at_ms ON tool_runs(conversation_id, created_at_ms);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+  task_id TEXT PRIMARY KEY,
+  goal TEXT NOT NULL,
+  status TEXT NOT NULL,
+  current_step TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  max_retry INTEGER NOT NULL,
+  acceptance_cmd TEXT NOT NULL,
+  dry_run INTEGER NOT NULL DEFAULT 0,
+  request_id TEXT NOT NULL,
+  trace_id TEXT NOT NULL,
+  stop_reason TEXT,
+  error_code TEXT,
+  scope_paths_json TEXT NOT NULL,
+  forbidden_paths_json TEXT NOT NULL,
+  last_verify_json TEXT,
+  logs_json TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  finished_at_ms INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_created_at_ms ON agent_tasks(created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_updated_at_ms ON agent_tasks(status, updated_at_ms);
+
+CREATE TABLE IF NOT EXISTS agent_task_artifacts (
+  task_id TEXT PRIMARY KEY,
+  changed_files_json TEXT NOT NULL,
+  test_result TEXT,
+  summary TEXT,
+  updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_task_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  message TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_task_logs_task_id_id ON agent_task_logs(task_id, id);

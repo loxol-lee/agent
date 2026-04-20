@@ -5,7 +5,12 @@ import binascii
 import hashlib
 import json
 import re
+import shlex
+import subprocess
+import threading
+import time
 import uuid
+from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -988,7 +993,7 @@ def static_app_js() -> Response:
         var m = (payload && payload.message) ? payload.message : "error";
         var ec = (payload && payload.error_code) ? payload.error_code : "";
         setRunMeta({request_id: reqId, error_code: ec});
-        if (bubble) bubble.textContent += "\n[error" + (ec ? (":" + ec) : "") + "] " + m + (reqId ? (" (request_id=" + reqId + ")") : "");
+        if (bubble) bubble.textContent += "\\n[error" + (ec ? (":" + ec) : "") + "] " + m + (reqId ? (" (request_id=" + reqId + ")") : "");
       } else if (ev.type === "done") {
         var doneUsage = payload && payload.usage ? payload.usage : null;
         var stopReason = payload && payload.stop_reason ? payload.stop_reason : "";
@@ -1130,30 +1135,30 @@ def static_app_js() -> Response:
           } catch(e) {}
         }
 
-        var msg = "导出摘要\n"
-          + "conversation_id: " + (j && j.conversation_id ? j.conversation_id : cid) + "\n"
-          + "messages: " + ((j && j.messages && j.messages.length) ? j.messages.length : 0) + "\n"
-          + "trace_ids: " + traceCount + "\n"
-          + "usage p/c/t: " + p + "/" + c + "/" + t + "\n"
-          + "attachments count/bytes: " + attCount + "/" + attBytes + "\n"
-          + "attachment_refs traces/mentions: " + attRefTraces + "/" + attRefMentions + "\n"
-          + "stop_reason top: " + (stopTop.length ? stopTop.map(function(it){return it[0]+":"+it[1];}).join(", ") : "none") + "\n"
-          + "tool_error top: " + (errTop.length ? errTop.map(function(it){return it[0]+":"+it[1];}).join(", ") : "none") + "\n"
-          + "risk_signals: " + ((qsStatus === "warn" && qsHits.length) ? ("⚠ " + qsHits.join(", ")) : "OK") + "\n"
-          + inspectLine + "\n"
-          + (inspectCopied ? "inspect_line 已复制到剪贴板\n\n" : (inspectCopySkipped ? "inspect_line 本会话已复制过，本次不覆盖剪贴板\n\n" : "inspect_line 复制失败，可手动复制上面一行\n\n"))
+        var msg = "导出摘要\\n"
+          + "conversation_id: " + (j && j.conversation_id ? j.conversation_id : cid) + "\\n"
+          + "messages: " + ((j && j.messages && j.messages.length) ? j.messages.length : 0) + "\\n"
+          + "trace_ids: " + traceCount + "\\n"
+          + "usage p/c/t: " + p + "/" + c + "/" + t + "\\n"
+          + "attachments count/bytes: " + attCount + "/" + attBytes + "\\n"
+          + "attachment_refs traces/mentions: " + attRefTraces + "/" + attRefMentions + "\\n"
+          + "stop_reason top: " + (stopTop.length ? stopTop.map(function(it){return it[0]+":"+it[1];}).join(", ") : "none") + "\\n"
+          + "tool_error top: " + (errTop.length ? errTop.map(function(it){return it[0]+":"+it[1];}).join(", ") : "none") + "\\n"
+          + "risk_signals: " + ((qsStatus === "warn" && qsHits.length) ? ("⚠ " + qsHits.join(", ")) : "OK") + "\\n"
+          + inspectLine + "\\n"
+          + (inspectCopied ? "inspect_line 已复制到剪贴板\\n\\n" : (inspectCopySkipped ? "inspect_line 本会话已复制过，本次不覆盖剪贴板\\n\\n" : "inspect_line 复制失败，可手动复制上面一行\\n\\n"))
           + "查看详细质量指标？点击【确定】查看，点击【取消】继续下载。";
 
         var showDetail = false;
         try { showDetail = confirm(msg); } catch(e) {}
         if (showDetail) {
-          var detail = "quality_signals 详情\n"
-            + "status: " + qsStatus + "\n"
-            + "hits: " + (qsHits.length ? qsHits.join(", ") : "none") + "\n"
-            + "thresholds: " + JSON.stringify(qsThresholds) + "\n"
-            + "metrics: " + JSON.stringify(qsMetrics) + "\n"
-            + "attachment_refs traces/mentions: " + attRefTraces + "/" + attRefMentions + "\n"
-            + "inspect_summary: " + inspectSummaryText + "\n"
+          var detail = "quality_signals 详情\\n"
+            + "status: " + qsStatus + "\\n"
+            + "hits: " + (qsHits.length ? qsHits.join(", ") : "none") + "\\n"
+            + "thresholds: " + JSON.stringify(qsThresholds) + "\\n"
+            + "metrics: " + JSON.stringify(qsMetrics) + "\\n"
+            + "attachment_refs traces/mentions: " + attRefTraces + "/" + attRefMentions + "\\n"
+            + "inspect_summary: " + inspectSummaryText + "\\n"
             + inspectLine;
 
           var copied = false;
@@ -1165,7 +1170,7 @@ def static_app_js() -> Response:
           }
 
           if (copied) {
-            try { alert("详细质量指标已复制到剪贴板\n\n" + detail); } catch(e) {}
+            try { alert("详细质量指标已复制到剪贴板\\n\\n" + detail); } catch(e) {}
           } else {
             try { window.prompt("复制以下质量指标文本", detail); } catch(e) { try { alert(detail); } catch(_) {} }
           }
@@ -1726,6 +1731,306 @@ def api_conversation_quality_gate(
         "contract_drift": contract_drift,
         "inspect_line": inspect_line,
     }
+
+
+class AgentTaskCreateIn(BaseModel):
+    goal: str = Field(min_length=1, max_length=2000)
+    scope_paths: list[str] = Field(default_factory=list, max_length=50)
+    forbidden_paths: list[str] = Field(default_factory=list, max_length=50)
+    acceptance_cmd: str = Field(min_length=1, max_length=1000)
+    max_retry: int = Field(default=3, ge=1, le=5)
+    dry_run: bool = False
+    auto_start: bool = True
+
+
+_AGENT_TASKS: dict[str, dict[str, Any]] = {}
+_AGENT_TASKS_LOCK = threading.Lock()
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _task_public(task: dict[str, Any]) -> dict[str, Any]:
+    artifacts = task.get("artifacts") or {}
+    return {
+        "task_id": task.get("task_id"),
+        "status": task.get("status"),
+        "goal": task.get("goal"),
+        "request_id": task.get("request_id"),
+        "trace_id": task.get("trace_id"),
+        "current_step": task.get("current_step"),
+        "attempt": task.get("attempt"),
+        "max_retry": task.get("max_retry"),
+        "stop_reason": task.get("stop_reason"),
+        "error_code": task.get("error_code"),
+        "created_at_ms": task.get("created_at_ms"),
+        "updated_at_ms": task.get("updated_at_ms"),
+        "finished_at_ms": task.get("finished_at_ms"),
+        "logs": list(task.get("logs") or []),
+        "last_verify": task.get("last_verify"),
+        "test_result": artifacts.get("test_result"),
+        "summary": artifacts.get("summary"),
+    }
+
+
+def _task_log(task: dict[str, Any], message: str, store: Storage | None = None) -> None:
+    ts = _now_ms()
+    logs = task.setdefault("logs", [])
+    if isinstance(logs, list):
+        logs.append({"ts": ts, "message": message[:1000]})
+    if store is not None:
+        fn = getattr(store, "insert_agent_task_log", None)
+        if callable(fn):
+            fn(str(task.get("task_id") or ""), ts, message[:1000])
+
+
+def _persist_task(store: Storage | None, task: dict[str, Any]) -> None:
+    if store is None:
+        return
+    fn = getattr(store, "insert_agent_task", None)
+    if callable(fn):
+        fn(task)
+    fn2 = getattr(store, "upsert_agent_task_artifacts", None)
+    if callable(fn2):
+        fn2(str(task.get("task_id") or ""), task.get("artifacts") or {"changed_files": [], "test_result": None, "summary": ""})
+
+
+def _normalize_task_error_code(code: object) -> str:
+    c = str(code or "").strip().upper()
+    if not c:
+        return "TASK_RUNTIME_ERROR"
+    mapping = {
+        "COMMAND_EMPTY": "COMMAND_EMPTY",
+        "COMMAND_NOT_ALLOWED": "COMMAND_NOT_ALLOWED",
+        "COMMAND_TIMEOUT": "COMMAND_TIMEOUT",
+        "COMMAND_FAILED": "COMMAND_FAILED",
+        "RETRY_EXHAUSTED": "RETRY_EXHAUSTED",
+    }
+    return mapping.get(c, "TASK_RUNTIME_ERROR")
+
+
+def _task_summary_from_verify(verify: dict[str, Any], attempt: int, max_retry: int) -> str:
+    ok = bool(verify.get("ok"))
+    if ok:
+        return f"acceptance command passed on attempt {attempt}"
+    code = _normalize_task_error_code(verify.get("error_code"))
+    exit_code = verify.get("exit_code")
+    return f"acceptance failed: code={code} exit={exit_code} attempt={attempt}/{max_retry}"
+
+
+def _task_not_found(task_id: str) -> HTTPException:
+    return HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "task_id": task_id})
+
+
+def _run_acceptance_command(settings: Settings, command: str) -> dict[str, Any]:
+    parts = shlex.split(command)
+    if not parts:
+        return {"ok": False, "error_code": "COMMAND_EMPTY", "stdout": "", "stderr": "empty command", "exit_code": -1}
+    allowed_bins = {"python", "python3", "pip", "git"}
+    if parts[0] not in allowed_bins:
+        return {"ok": False, "error_code": "COMMAND_NOT_ALLOWED", "stdout": "", "stderr": f"bin_not_allowed:{parts[0]}", "exit_code": -1}
+    cwd = str(Path(str(settings.project_root)).resolve())
+    try:
+        proc = subprocess.run(parts, cwd=cwd, capture_output=True, text=True, timeout=120)
+        return {
+            "ok": proc.returncode == 0,
+            "error_code": (None if proc.returncode == 0 else "COMMAND_FAILED"),
+            "stdout": (proc.stdout or "")[:8000],
+            "stderr": (proc.stderr or "")[:8000],
+            "exit_code": int(proc.returncode),
+            "command": command,
+            "cwd": cwd,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error_code": "COMMAND_TIMEOUT", "stdout": "", "stderr": "timeout", "exit_code": -1, "command": command, "cwd": cwd}
+
+
+def _run_agent_task(task_id: str, settings: Settings, store: Storage | None = None) -> None:
+    with _AGENT_TASKS_LOCK:
+        task = _AGENT_TASKS.get(task_id)
+        if not isinstance(task, dict) or task.get("status") != "queued":
+            return
+        task["status"] = "running"
+        task["current_step"] = "PLAN"
+        task["updated_at_ms"] = _now_ms()
+        _task_log(task, "plan_started", store)
+        _persist_task(store, task)
+
+    while True:
+        with _AGENT_TASKS_LOCK:
+            task = _AGENT_TASKS.get(task_id)
+            if not isinstance(task, dict) or task.get("status") == "cancelled":
+                return
+            attempt = int(task.get("attempt") or 0) + 1
+            task["attempt"] = attempt
+            task["status"] = "verifying"
+            task["current_step"] = "VERIFY"
+            task["updated_at_ms"] = _now_ms()
+            _task_log(task, f"verify_started_attempt_{attempt}", store)
+            cmd = str(task.get("acceptance_cmd") or "")
+            max_retry = int(task.get("max_retry") or 1)
+            _persist_task(store, task)
+
+        verify = _run_acceptance_command(settings, cmd)
+
+        with _AGENT_TASKS_LOCK:
+            task = _AGENT_TASKS.get(task_id)
+            if not isinstance(task, dict) or task.get("status") == "cancelled":
+                return
+            task["last_verify"] = verify
+            task["updated_at_ms"] = _now_ms()
+            artifacts = task.setdefault("artifacts", {"changed_files": [], "test_result": None, "summary": ""})
+            if bool(verify.get("ok")):
+                task["status"] = "succeeded"
+                task["current_step"] = "FINISH"
+                task["stop_reason"] = "completed"
+                task["error_code"] = None
+                task["finished_at_ms"] = _now_ms()
+                artifacts["test_result"] = "passed"
+                artifacts["summary"] = _task_summary_from_verify(verify, attempt, max_retry)
+                _task_log(task, "task_finished", store)
+                _persist_task(store, task)
+                return
+            if attempt < max_retry:
+                task["status"] = "retrying"
+                task["current_step"] = "RETRY"
+                task["error_code"] = _normalize_task_error_code(verify.get("error_code") or "COMMAND_FAILED")
+                _task_log(task, f"retrying_attempt_{attempt}", store)
+                _persist_task(store, task)
+            else:
+                task["status"] = "failed"
+                task["current_step"] = "FINISH"
+                task["stop_reason"] = "retry_exhausted"
+                task["error_code"] = _normalize_task_error_code(verify.get("error_code") or "RETRY_EXHAUSTED")
+                task["finished_at_ms"] = _now_ms()
+                artifacts["test_result"] = "failed"
+                artifacts["summary"] = _task_summary_from_verify(verify, attempt, max_retry)
+                _task_log(task, "task_failed", store)
+                _persist_task(store, task)
+                return
+
+
+@router.post("/api/agent/tasks")
+def api_agent_task_create(request: Request, body: AgentTaskCreateIn) -> dict:
+    task_id = f"task_{uuid.uuid4().hex[:12]}"
+    now = _now_ms()
+    task = {
+        "task_id": task_id,
+        "status": "queued",
+        "goal": body.goal,
+        "scope_paths": list(body.scope_paths),
+        "forbidden_paths": list(body.forbidden_paths),
+        "acceptance_cmd": body.acceptance_cmd,
+        "max_retry": int(body.max_retry),
+        "attempt": 0,
+        "dry_run": bool(body.dry_run),
+        "current_step": "QUEUED",
+        "request_id": task_id,
+        "trace_id": task_id,
+        "stop_reason": None,
+        "error_code": None,
+        "created_at_ms": now,
+        "updated_at_ms": now,
+        "finished_at_ms": None,
+        "logs": [],
+        "last_verify": None,
+        "artifacts": {"changed_files": [], "test_result": None, "summary": ""},
+    }
+    _task_log(task, "task_created", _get_store(request))
+    with _AGENT_TASKS_LOCK:
+        _AGENT_TASKS[task_id] = task
+
+    store = _get_store(request)
+    _persist_task(store, task)
+
+    if body.auto_start:
+        settings = _get_settings(request)
+        th = threading.Thread(target=_run_agent_task, args=(task_id, settings, store), daemon=True)
+        th.start()
+    return {"ok": True, **_task_public(task)}
+
+
+@router.get("/api/agent/tasks")
+def api_agent_tasks(request: Request, limit: int = 50) -> dict:
+    store = _get_store(request)
+    fn = getattr(store, "list_agent_tasks", None)
+    if callable(fn):
+        rows = fn(limit=max(1, min(int(limit), 200))) or []
+        fn_art = getattr(store, "get_agent_task_artifacts", None)
+        out: list[dict[str, Any]] = []
+        for t in rows:
+            task = dict(t)
+            task["artifacts"] = (fn_art(task.get("task_id")) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+            fn_logs = getattr(store, "list_agent_task_logs", None)
+            if callable(fn_logs):
+                task["logs"] = fn_logs(str(task.get("task_id") or ""), limit=500)
+            out.append(_task_public(task))
+        return {"ok": True, "items": out}
+    with _AGENT_TASKS_LOCK:
+        rows = sorted(_AGENT_TASKS.values(), key=lambda x: int(x.get("created_at_ms") or 0), reverse=True)
+        out = [_task_public(t) for t in rows[: max(1, min(int(limit), 200))]]
+        return {"ok": True, "items": out}
+
+
+@router.get("/api/agent/tasks/{task_id}")
+def api_agent_task_get(request: Request, task_id: str) -> dict:
+    store = _get_store(request)
+    fn = getattr(store, "get_agent_task", None)
+    if callable(fn):
+        task = fn(task_id)
+        if isinstance(task, dict):
+            fn_art = getattr(store, "get_agent_task_artifacts", None)
+            task["artifacts"] = (fn_art(task_id) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+            fn_logs = getattr(store, "list_agent_task_logs", None)
+            if callable(fn_logs):
+                task["logs"] = fn_logs(task_id, limit=500)
+            return {"ok": True, **_task_public(task)}
+    with _AGENT_TASKS_LOCK:
+        task = _AGENT_TASKS.get(task_id)
+        if not isinstance(task, dict):
+            raise _task_not_found(task_id)
+        return {"ok": True, **_task_public(task)}
+
+
+@router.get("/api/agent/tasks/{task_id}/artifacts")
+def api_agent_task_artifacts(request: Request, task_id: str) -> dict:
+    store = _get_store(request)
+    fn = getattr(store, "get_agent_task_artifacts", None)
+    fn_task = getattr(store, "get_agent_task", None)
+    if callable(fn):
+        art = fn(task_id)
+        if art is not None:
+            t = fn_task(task_id) if callable(fn_task) else None
+            return {"ok": True, "task_id": task_id, "artifacts": art, "last_verify": (t.get("last_verify") if isinstance(t, dict) else None)}
+    with _AGENT_TASKS_LOCK:
+        task = _AGENT_TASKS.get(task_id)
+        if not isinstance(task, dict):
+            raise _task_not_found(task_id)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "artifacts": task.get("artifacts") or {"changed_files": [], "test_result": None, "summary": ""},
+            "last_verify": task.get("last_verify"),
+        }
+
+
+@router.post("/api/agent/tasks/{task_id}/cancel")
+def api_agent_task_cancel(request: Request, task_id: str) -> dict:
+    with _AGENT_TASKS_LOCK:
+        task = _AGENT_TASKS.get(task_id)
+        if not isinstance(task, dict):
+            raise _task_not_found(task_id)
+        if task.get("status") in {"succeeded", "failed", "cancelled"}:
+            return {"ok": True, "task_id": task_id, "status": task.get("status")}
+        task["status"] = "cancelled"
+        task["current_step"] = "CANCELLED"
+        task["stop_reason"] = "cancelled"
+        task["updated_at_ms"] = _now_ms()
+        task["finished_at_ms"] = _now_ms()
+        _task_log(task, "task_cancelled", _get_store(request))
+        _persist_task(_get_store(request), task)
+        return {"ok": True, **_task_public(task)}
 
 
 class DeleteMemoriesIn(BaseModel):

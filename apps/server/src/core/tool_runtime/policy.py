@@ -49,7 +49,7 @@ class ToolPolicy:
             return PolicyDecision(False, ERROR_TOOL_NOT_ALLOWED, "disabled")
         if str(spec.risk).lower() != "low":
             return PolicyDecision(False, ERROR_TOOL_NOT_ALLOWED, "risk")
-        if bool(spec.side_effect):
+        if bool(spec.side_effect) and name not in {"write_file", "run_command"}:
             return PolicyDecision(False, ERROR_TOOL_NOT_ALLOWED, "side_effect")
 
         ok, err = _validate_json_schema(spec.schema, args)

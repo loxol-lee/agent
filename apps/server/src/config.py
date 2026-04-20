@@ -29,6 +29,7 @@ class Settings:
     siliconflow_base_url: str
     siliconflow_api_key: str | None
     siliconflow_model: str
+    project_root: str
 
 
 def load_settings() -> Settings:
@@ -39,10 +40,12 @@ def load_settings() -> Settings:
     base_url = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
     api_key = os.environ.get("SILICONFLOW_API_KEY")
     model = os.environ.get("SILICONFLOW_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+    project_root = os.environ.get("AGUNT_PROJECT_ROOT", str(server_dir.parents[1]))
 
     return Settings(
         sqlite_path=sqlite_path,
         siliconflow_base_url=base_url,
         siliconflow_api_key=api_key,
         siliconflow_model=model,
+        project_root=project_root,
     )

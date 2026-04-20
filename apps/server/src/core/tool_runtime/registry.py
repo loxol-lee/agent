@@ -9,13 +9,13 @@ from core.contracts.tools import ToolSpec
 from core.contracts.observability import Tracer
 from core.contracts.storage import Storage
 from core.tool_runtime.tools.calc import calc
-from core.tool_runtime.tools.echo import echo
+from core.tool_runtime.tools.echo import echo, list_files, read_file, run_command, write_file
 from core.tool_runtime.tools.recall import recall
 from core.tool_runtime.tools.remember import memory_forget, remember
 from core.tool_runtime.tools.time_now import time_now
 
 
-DEFAULT_ALLOWLIST: set[str] = {"time_now", "remember", "recall", "memory_forget", "calc"}
+DEFAULT_ALLOWLIST: set[str] = {"time_now", "remember", "recall", "memory_forget", "calc", "list_files", "read_file", "write_file", "run_command"}
 DEFAULT_DENYLIST: set[str] = {"file_write", "http_request", "web_fetch", "run_shell", "exec", "send_message"}
 
 
@@ -133,6 +133,68 @@ def default_registry() -> ToolRegistry:
             },
             enabled=False,
         ),
+        "list_files": ToolSpec(
+            name="list_files",
+            desc="列出项目目录中的文件和子目录（受白名单路径限制）",
+            risk="low",
+            side_effect=False,
+            timeout_ms=3000,
+            schema={
+                "type": "object",
+                "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 2000}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+                "required": ["path"],
+            },
+            enabled=True,
+        ),
+        "read_file": ToolSpec(
+            name="read_file",
+            desc="读取项目内文件片段（按行返回）",
+            risk="low",
+            side_effect=False,
+            timeout_ms=3000,
+            schema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "offset": {"type": "integer", "minimum": 1, "maximum": 1000000},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
+                },
+                "required": ["file_path"],
+            },
+            enabled=True,
+        ),
+        "write_file": ToolSpec(
+            name="write_file",
+            desc="写入项目内文件（原子替换）",
+            risk="low",
+            side_effect=True,
+            timeout_ms=5000,
+            schema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "content": {"type": "string", "minLength": 0, "maxLength": 2000000},
+                },
+                "required": ["file_path", "content"],
+            },
+            enabled=True,
+        ),
+        "run_command": ToolSpec(
+            name="run_command",
+            desc="在项目根目录内执行白名单命令并返回输出",
+            risk="low",
+            side_effect=True,
+            timeout_ms=120000,
+            schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "minLength": 1, "maxLength": 1000},
+                    "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 120},
+                },
+                "required": ["command"],
+            },
+            enabled=True,
+        ),
     }
 
     handlers: dict[str, ToolHandler] = {
@@ -142,6 +204,10 @@ def default_registry() -> ToolRegistry:
         "memory_forget": memory_forget,
         "calc": calc,
         "echo": echo,
+        "list_files": list_files,
+        "read_file": read_file,
+        "write_file": write_file,
+        "run_command": run_command,
     }
 
     return ToolRegistry(specs=specs, handlers=handlers)
