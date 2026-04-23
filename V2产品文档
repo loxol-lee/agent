@@ -1,0 +1,286 @@
+# V2 产品需求文档（PRD）— 多龙虾协作群执行系统
+
+## 1. 产品定位
+- V2 目标：从单龙虾执行引擎升级为“多角色龙虾协作群”。
+- 核心场景：你抛出一个课题，多个角色龙虾并行分析、讨论、执行、复核，最终给出可落地结果。
+- 产品定位：面向“单Owner、多智能角色”的研发与决策协作系统。
+
+## 2. 业务目标与成功指标
+- 业务目标：
+  - 让复杂课题可由多角色协作完成（需求、方案、研发、测试、商业与财务评估）。
+  - 提升任务一次完成率与方案质量。
+- 成功指标（V2）：
+  - 多角色任务完成率 ≥ 75%
+  - 关键任务返工率下降 ≥ 30%
+  - 方案通过率（Owner一次通过）≥ 60%
+  - 端到端可追踪率 100%（task_id/trace_id/agent_id）
+
+## 3. 用户与角色
+- 主用户：Owner（你）
+- 系统角色（初始）：
+  - PM Agent：拆需求、定义验收标准
+  - RD Agent：实现代码变更、执行命令
+  - QA Agent：设计测试、判定风险
+  - BA Agent：业务价值与影响评估
+  - Finance Agent：成本与投入产出评估
+  - ThinkTank Agent：备选方案与创新建议
+  - SME Agent：专业领域规则把关
+
+## 4. 范围定义
+- In Scope：
+  - 多角色会话编排（回合制/并行制）
+  - 角色知识源挂载（每角色独立）
+  - 角色权限矩阵（谁可写代码、谁可审核）
+  - 讨论 -> 决策 -> 执行 -> 复核闭环
+  - 最终由“仲裁器”输出统一结论
+- Out of Scope：
+  - 自主外网爬取（默认关闭）
+  - 自动生产部署（只到代码与验证）
+  - 跨项目写入（仅限本项目）
+
+## 5. 核心能力
+- 多角色编排器（Group Orchestrator）
+  - 支持顺序发言、并行发言、定向追问
+- 角色记忆系统
+  - 全局记忆（任务级）+ 角色私有记忆（角色级）
+- 角色知识库
+  - 每个角色可绑定独立知识源（文档、规范、策略）
+- 决策机制
+  - 多方案打分
+  - 冲突仲裁（默认 Owner 最终裁决）
+- 执行与门禁
+  - RD 执行改动后，QA 必须复核
+  - 复用 V1 quality-gate 作为统一出口门禁
+
+## 6. 协作流程（标准）
+1. Owner 提交课题（目标、限制、期限）
+2. PM Agent 输出拆解与验收标准
+3. 各角色并行给出意见（PM/RD/QA/BA/Finance/SME/ThinkTank）
+4. 仲裁器汇总冲突点，要求补证据
+5. RD 执行方案，QA 验证，BA/Finance评估收益
+6. 生成统一结论包（方案、改动、测试、风险、ROI）
+7. Owner 一键批准/退回重做
+
+## 7. 权限模型（关键）
+- Owner：可查看全部、可批准、可取消
+- PM/BA/Finance/ThinkTank/SME：默认只读+分析
+- RD：可读写文件、可执行命令（白名单）
+- QA：只读+测试命令执行，不可写业务代码
+- 安全规则：
+  - 角色越权调用工具一律拒绝并记录 `COMMAND_NOT_ALLOWED` 或 `ROLE_PERMISSION_DENIED`
+
+## 8. 接口设计（V2 最小）
+- `POST /api/group/tasks`
+  - 创建多角色任务
+- `GET /api/group/tasks/{task_id}`
+  - 查询任务总体状态与阶段
+- `GET /api/group/tasks/{task_id}/thread`
+  - 获取角色讨论线程
+- `POST /api/group/tasks/{task_id}/approve`
+  - Owner 批准方案
+- `POST /api/group/tasks/{task_id}/rerun`
+  - 指定阶段重跑（如仅重跑 QA）
+- `GET /api/group/tasks/{task_id}/artifacts`
+  - 输出最终产物包（代码改动、测试、评估）
+
+## 9. 数据模型（建议）
+- `group_tasks`
+  - task_id, goal, status, owner_id, created_at, finished_at
+- `group_task_rounds`
+  - task_id, round_no, phase, started_at, finished_at
+- `group_agent_messages`
+  - task_id, round_no, agent_id, role, content, refs_json
+- `group_decisions`
+  - task_id, decision_type, winner_plan_id, reason, approved_by
+- `group_artifacts`
+  - task_id, artifact_type, path_or_blob, summary, hash
+
+## 10. 关键状态机
+- `created -> planning -> discussion -> execution -> qa_verifying -> decision -> done`
+- 异常分支：
+  - `execution_failed -> retrying_execution -> execution`
+  - `qa_failed -> rework_requested -> execution`
+  - `cancelled`
+
+## 11. 安全与治理
+- 路径白名单：仅 `/Users/lixiaoyi/Documents/newtext/agunt`
+- 命令白名单：继承 V1（并按角色进一步收敛）
+- 风险拦截：
+  - 高风险命令二次确认
+  - `.env/密钥` 默认不可读不可写
+- 审计追踪：
+  - 每条工具调用必须带 `task_id/agent_id/trace_id/request_id`
+
+## 12. 验收标准（DoD）
+- 能跑通至少 1 个多角色课题（含讨论、执行、QA复核、最终结论）
+- 每个角色输出可区分、可追溯
+- RD 改动必须经过 QA 复核后才可进入最终结论
+- quality-gate 全绿后才允许标记 `done`
+- 关键数据可导出（thread + decisions + artifacts）
+
+## 13. UAT 场景
+- UAT-1：多角色并行讨论可正常显示与汇总
+- UAT-2：角色权限生效（PM不可写代码、RD可写）
+- UAT-3：QA失败可触发回退到 execution
+- UAT-4：Owner 可强制批准/取消
+- UAT-5：审计导出包含完整 trace 映射
+
+## 14. 里程碑计划
+- M1（3天）：多角色会话与线程展示
+- M2（3天）：角色权限矩阵 + 编排器
+- M3（2天）：决策仲裁 + 产物包导出
+- M4（2天）：接入 V1 门禁 + UAT + 修复
+
+## 15. 与 V1 的关系
+- V1 是执行内核（工具+状态机+门禁）
+- V2 是协作外壳（多角色编排+决策+治理）
+- 原则：V2 不重写 V1，只做编排与扩展
+
+## 16. 风险与预案
+- 风险：角色意见冲突导致流程卡住
+  - 预案：超时后自动触发仲裁器给默认决策
+- 风险：多角色上下文成本过高
+  - 预案：按阶段裁剪上下文，保留摘要
+- 风险：角色越权调用
+  - 预案：工具层权限硬拒绝 + 审计告警
+
+## 17. 发布与回滚
+- 发布前：
+  - 多角色 UAT 全通过
+  - quality-gate 绿色
+- 回滚：
+  - 配置关闭 `AGUNT_GROUP_MODE_ENABLED`
+  - 回退到 V1 单龙虾模式
+
+## 18. 附录：课题输入模板（V2）
+- 课题目标：
+- 成功标准：
+- 时间要求：
+- 约束条件：
+- 允许改动范围：
+- 禁止改动范围：
+- 必跑验收命令：
+- 最终输出格式（方案/代码/测试/评估）：
+
+## 19. P0 拆单（按优先级执行）
+
+### T1 状态机硬约束（最高优先级）
+- 目标：把 `created -> planning -> discussion -> execution -> qa_verifying -> decision -> done` 变成受控流转，禁止非法跳转。
+- 主要文件：`apps/server/src/connectors/web/routes.py`、`apps/server/src/core/infra/storage/sqlite_store.py`
+- 接口影响：`POST /api/group/tasks/{task_id}/rerun`、`POST /api/group/tasks/{task_id}/approve`
+- 测试：增加“非法阶段跳转被拒绝”“允许阶段跳转成功”用例。
+- 验收：非法流转返回固定错误码；合法流转状态与 phase 一致。
+
+### T2 角色权限矩阵（Owner/RD/QA）
+- 目标：Owner 可审批/取消；RD 可执行；QA 只读+验证；越权统一拒绝。
+- 主要文件：`apps/server/src/connectors/web/routes.py`、`apps/server/src/core/tool_runtime/executor.py`
+- 接口影响：`POST /api/group/tasks/{task_id}/approve`、后续执行入口。
+- 测试：增加“RD 可执行、QA 不可写、Owner 不可越权执行”用例。
+- 验收：越权返回 `ROLE_PERMISSION_DENIED`，并写入审计日志。
+
+### T3 RD 执行 -> QA 复核闭环
+- 目标：执行后必须进入 `qa_verifying`，QA 失败回退 `execution`。
+- 主要文件：`apps/server/src/connectors/web/routes.py`、`apps/server/src/core/orchestrator/agent_runtime.py`
+- 接口影响：`POST /api/group/tasks/{task_id}/rerun`、`GET /api/group/tasks/{task_id}`
+- 测试：增加“QA fail 回退 execution”“QA pass 进入 decision”用例。
+- 验收：任务轨迹可完整复盘，状态机无断档。
+
+### T4 done 前强制 quality-gate
+- 目标：未通过 quality-gate 不允许置 `done`。
+- 主要文件：`apps/server/src/connectors/web/routes.py`、`.github/workflows/quality-gate.yml`
+- 接口影响：`POST /api/group/tasks/{task_id}/approve`
+- 测试：增加“门禁失败时 approve 被阻断”用例。
+- 验收：门禁失败返回明确错误码，`status` 不会进入 `done`。
+
+### T5 决策与审计导出完整化
+- 目标：`thread + decisions + artifacts` 可导出并可追踪到 `task_id/trace_id`。
+- 主要文件：`apps/server/src/core/infra/storage/schema.sql`、`apps/server/src/core/infra/storage/sqlite_store.py`、`apps/server/src/connectors/web/routes.py`
+- 接口影响：`GET /api/group/tasks/{task_id}/thread`、`GET /api/group/tasks/{task_id}/decisions`、`GET /api/group/tasks/{task_id}/artifacts`
+- 测试：增加“approve 后 decision 可读”“导出字段完整性”用例。
+- 验收：导出结果可直接用于复盘与审计。
+
+## 20. P0 验收命令（统一）
+- `cd /Users/lixiaoyi/Documents/newtext/agunt/apps/server/src`
+- `PYTHONWARNINGS="error::ResourceWarning" python3 -m unittest -v test_quality_gate_contract.py`
+
+## 21. V2收口与后续计划（阶段1/2/3）
+
+### 21.1 当前结论（里程碑状态）
+- 结论：V2 后端闭环已完成，可进入里程碑收口与结构重构阶段。
+- 依据：
+  - 多角色任务主链路已打通（create/get/thread/artifacts/approve/rerun）。
+  - 状态机、权限矩阵、QA门禁、审计导出、KPI看板、预检与批量接口已落地。
+  - 回归结果：`PYTHONWARNINGS="error::ResourceWarning" python3 -m unittest -v test_quality_gate_contract.py` 全绿（44/44）。
+
+### 21.2 阶段1：里程碑收口（P0）
+- 目标：固化“V2完成证据”，形成可审阅、可交接、可回滚的发布记录。
+- 任务：
+  - 输出《V2完成说明》（能力范围、接口清单、测试结果、风险说明）。
+  - 统一提交说明与版本标记（建议 tag：`v2-backend-milestone`）。
+  - 将回归命令与关键终端结果归档到本文档。
+- 验收标准：
+  - 非研发同学可读懂“做了什么、怎么验收、如何回滚”。
+  - 里程碑信息可用于后续发布评审。
+
+### 21.3 阶段2：代码重构拆分（P1）
+- 目标：在不改变对外行为前提下，降低 `routes.py` 复杂度并提升可维护性。
+- 任务：
+  - 按领域拆分：`group_tasks`、`group_kpi`、`group_audit`、`group_prechecks` 等模块。
+  - 抽离通用逻辑：权限校验、状态流转校验、统一错误码处理。
+  - 每次拆分后执行全量回归，确保行为等价。
+- 验收标准：
+  - 接口路径/字段/错误码不变。
+  - 全量测试持续全绿。
+
+### 21.4 阶段3：产品化外围补齐（P2）
+- 目标：从“后端可用”升级到“可运营、可发布、可观测”。
+- 任务：
+  - 基于现有 `kpi:*`、`audit-closure` 补可视化消费与运营视图。
+  - 增加运行监控指标（阻断率、闭环率、失败率）。
+  - 固化发布/回滚SOP（继续使用 `AGUNT_GROUP_MODE_ENABLED` 作为开关）。
+- 验收标准：
+  - 可灰度发布，可快速回滚，可定位关键故障。
+
+### 21.5 执行顺序与节奏
+1. 先完成阶段1（当天完成）。
+2. 再进行阶段2（预计2-4天，按模块拆分）。
+3. 最后阶段3（预计2-3天，按运营优先级落地）。
+
+### 21.6 统一验收命令
+- `cd /Users/lixiaoyi/Documents/newtext/agunt/apps/server/src`
+- `PYTHONWARNINGS="error::ResourceWarning" python3 -m unittest -v test_quality_gate_contract.py`
+
+## 22. V2完成说明（里程碑）
+
+### 22.1 版本结论
+- 结论：V2“多龙虾协作群”后端闭环能力已完成，满足里程碑收口条件。
+- 当前状态：可进入阶段2（结构重构拆分），并保持接口行为不变。
+
+### 22.2 已完成能力范围
+- 任务主链路：`create/get/thread/artifacts/approve/rerun`。
+- 流程约束：状态机合法迁移、关闭态阻断、Owner一致性校验。
+- 权限矩阵：Owner/RD/QA 等角色动作权限与越权拒绝。
+- 质量门禁：`approve` 前强制 quality-gate 校验。
+- 审计导出：`export/audit/trace-map/audit-closure` 可追踪闭环。
+- 看板能力：`kpi` 单任务、批量、leaderboard、distribution、alerts、overview、owners。
+- 预检能力：`prechecks/can` 单任务与 batch。
+
+### 22.3 回归与证据
+- 验收命令：
+  - `cd /Users/lixiaoyi/Documents/newtext/agunt/apps/server/src`
+  - `PYTHONWARNINGS="error::ResourceWarning" python3 -m unittest -v test_quality_gate_contract.py`
+- 结果：`Ran 44 tests ... OK`。
+- 结论：在 ResourceWarning 严格模式下全绿，契约与回归一致。
+
+### 22.4 已知边界
+- 当前完成的是“后端能力闭环”，不等于“全部产品化终态”。
+- 仍需后续阶段补齐：可视化消费、运营监控与发布治理。
+
+### 22.5 发布与回滚
+- 发布建议：以里程碑标签发布（建议：`v2-backend-milestone`）。
+- 回滚策略：切换 `AGUNT_GROUP_MODE_ENABLED=false` 回退 V1 单龙虾模式。
+
+### 22.6 下一步执行
+1. 阶段2：按领域拆分 `routes.py`（`group_tasks/group_kpi/group_audit/group_prechecks`）。
+2. 阶段2每次改动后执行统一回归命令，确保行为等价。
+3. 阶段3：补可视化消费、监控指标、发布SOP。

@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Iterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -19,6 +20,51 @@ from pydantic import BaseModel, Field
 
 from config import Settings
 from connectors.web.auth import require_api_key
+from connectors.web.group_audit_routes import (
+    handle_group_task_audit,
+    handle_group_task_audit_closure,
+    handle_group_task_export,
+    handle_group_task_trace_map,
+    register_group_audit_routes,
+)
+from connectors.web.group_kpi_routes import (
+    handle_group_task_kpi,
+    handle_group_tasks_kpi_alerts,
+    handle_group_tasks_kpi_batch,
+    handle_group_tasks_kpi_batch_get,
+    handle_group_tasks_kpi_distribution,
+    handle_group_tasks_kpi_leaderboard,
+    handle_group_tasks_kpi_overview,
+    handle_group_tasks_kpi_owners,
+    register_group_kpi_routes,
+)
+from connectors.web.group_prechecks_routes import (
+    handle_group_task_approve_precheck,
+    handle_group_task_artifacts_update_precheck,
+    handle_group_task_can,
+    handle_group_task_cancel_precheck,
+    handle_group_task_execution_submit_precheck,
+    handle_group_task_prechecks,
+    handle_group_task_qa_review_precheck,
+    handle_group_task_rerun_precheck,
+    handle_group_task_thread_message_precheck,
+    handle_group_tasks_can_batch,
+    handle_group_tasks_prechecks_batch,
+    register_group_prechecks_routes,
+)
+from connectors.web.group_tasks_routes import (
+    get_group_artifacts_or_default,
+    get_group_task_or_raise,
+    handle_group_task_approve,
+    handle_group_task_artifacts_update,
+    handle_group_task_cancel,
+    handle_group_task_execution_submit,
+    handle_group_task_qa_review,
+    handle_group_task_rerun,
+    handle_group_task_thread_message,
+    list_group_tasks_or_raise,
+    register_group_tasks_routes,
+)
 from connectors.web.rate_limit import enforce_rate_limit
 from core.contracts.chat import ChatRequest, StreamEvent
 from core.contracts.observability import Tracer
@@ -35,6 +81,11 @@ from core.tool_runtime.executor import ToolExecutor
 
 
 router = APIRouter(dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)])
+
+register_group_tasks_routes(router)
+register_group_kpi_routes(router)
+register_group_prechecks_routes(router)
+register_group_audit_routes(router)
 
 
 class AttachmentIn(BaseModel):
@@ -83,6 +134,56 @@ _ALLOWED_ATTACHMENT_MIME_TYPES: set[str] = {
 _MAX_ATTACHMENTS = 5
 _MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 _MAX_ATTACHMENTS_TOTAL_BYTES = 20 * 1024 * 1024
+_SUMMARY_SIGNATURE_ALGO = "sha1-16"
+_SUMMARY_FINGERPRINT_ALGO = "sha1-16-stable"
+_DEFAULT_PROTECTED_FILE_PATTERNS = [
+    ".env",
+    ".env.",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".pem",
+    ".key",
+    "token",
+]
+
+
+def _summary_key(prefix: str, payload: dict[str, Any]) -> str:
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}{digest}"
+
+
+def _summary_payload(
+    *,
+    task_id: str,
+    attempt: int | None,
+    step_type: str | None,
+    step_ok: bool | None,
+    from_ts: int | None,
+    to_ts: int | None,
+    window_ms: int | None,
+    config_version: str,
+    salt: str,
+    generated_at_ms: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    p: dict[str, Any] = {
+        "task_id": task_id,
+        "attempt": attempt,
+        "step_type": step_type,
+        "step_ok": step_ok,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "window_ms": window_ms,
+        "config_version": config_version,
+        "salt": salt,
+    }
+    if generated_at_ms is not None:
+        p["summary_generated_at_ms"] = int(generated_at_ms)
+    if isinstance(extra, dict) and extra:
+        p.update(extra)
+    return p
 
 
 def _validate_attachments(attachments: list[AttachmentIn] | None) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -1733,13 +1834,116 @@ def api_conversation_quality_gate(
     }
 
 
+GROUP_PHASE_PLANNING = "planning"
+GROUP_PHASE_DISCUSSION = "discussion"
+GROUP_PHASE_EXECUTION = "execution"
+GROUP_PHASE_QA_VERIFYING = "qa_verifying"
+GROUP_PHASE_DECISION = "decision"
+
+GROUP_PHASE_ALLOWED = {
+    GROUP_PHASE_PLANNING,
+    GROUP_PHASE_DISCUSSION,
+    GROUP_PHASE_EXECUTION,
+    GROUP_PHASE_QA_VERIFYING,
+    GROUP_PHASE_DECISION,
+}
+GROUP_PHASE_RUNNING = {GROUP_PHASE_EXECUTION, GROUP_PHASE_QA_VERIFYING}
+
+GROUP_STATUS_CREATED = "created"
+GROUP_STATUS_RUNNING = "running"
+GROUP_STATUS_DONE = "done"
+
+GROUP_DECISION_TYPE_APPROVE = "approve"
+GROUP_DECISION_TYPE_CANCEL = "cancel"
+
+GROUP_ERROR_PHASE_NOT_ALLOWED = "GROUP_PHASE_NOT_ALLOWED"
+GROUP_ERROR_TRANSITION_NOT_ALLOWED = "GROUP_TRANSITION_NOT_ALLOWED"
+GROUP_ERROR_APPROVE_PHASE_INVALID = "GROUP_APPROVE_PHASE_INVALID"
+GROUP_ERROR_QA_PHASE_INVALID = "GROUP_QA_PHASE_INVALID"
+GROUP_ERROR_QUALITY_GATE_BLOCKED = "GROUP_QUALITY_GATE_BLOCKED"
+GROUP_ERROR_TASK_CLOSED = "GROUP_TASK_CLOSED"
+GROUP_ERROR_EXEC_PHASE_INVALID = "GROUP_EXEC_PHASE_INVALID"
+
+GROUP_PHASE_TRANSITIONS: dict[str, set[str]] = {
+    GROUP_PHASE_PLANNING: {GROUP_PHASE_DISCUSSION},
+    GROUP_PHASE_DISCUSSION: {GROUP_PHASE_EXECUTION},
+    GROUP_PHASE_EXECUTION: {GROUP_PHASE_QA_VERIFYING},
+    GROUP_PHASE_QA_VERIFYING: {GROUP_PHASE_DECISION, GROUP_PHASE_EXECUTION},
+    GROUP_PHASE_DECISION: {GROUP_PHASE_DISCUSSION, GROUP_PHASE_EXECUTION, GROUP_PHASE_QA_VERIFYING},
+}
+
+
+class GroupTaskCreateIn(BaseModel):
+    goal: str = Field(min_length=1, max_length=2000)
+    owner_id: str = Field(default="owner", min_length=1, max_length=200)
+
+
+class GroupTaskApproveIn(BaseModel):
+    owner_id: str = Field(default="owner", min_length=1, max_length=200)
+    actor_role: str = Field(default="owner", min_length=1, max_length=50)
+    winner_plan_id: str | None = Field(default=None, max_length=200)
+    reason: str = Field(default="", max_length=2000)
+
+
+class GroupTaskRerunIn(BaseModel):
+    phase: str = Field(default=GROUP_PHASE_DISCUSSION, min_length=1, max_length=50)
+    actor_role: str = Field(default="owner", min_length=1, max_length=50)
+
+
+class GroupTaskQaReviewIn(BaseModel):
+    passed: bool
+    reason: str = Field(default="", max_length=1000)
+    actor_role: str = Field(default="qa", min_length=1, max_length=50)
+
+
+class GroupTaskCancelIn(BaseModel):
+    owner_id: str = Field(default="owner", min_length=1, max_length=200)
+    actor_role: str = Field(default="owner", min_length=1, max_length=50)
+    reason: str = Field(default="", max_length=1000)
+
+
+class GroupTaskThreadMessageIn(BaseModel):
+    actor_role: str = Field(default="pm", min_length=1, max_length=50)
+    content: str = Field(min_length=1, max_length=4000)
+    refs: dict[str, Any] = Field(default_factory=dict)
+
+
+class GroupTaskExecutionSubmitIn(BaseModel):
+    actor_role: str = Field(default="rd", min_length=1, max_length=50)
+    changed_files: list[str] = Field(default_factory=list, max_length=200)
+    summary: str = Field(default="", max_length=4000)
+
+
+class GroupTaskArtifactsUpsertIn(BaseModel):
+    actor_role: str = Field(default="owner", min_length=1, max_length=50)
+    changed_files: list[str] = Field(default_factory=list, max_length=500)
+    test_result: str | None = Field(default=None, max_length=200)
+    summary: str = Field(default="", max_length=8000)
+
+
+class GroupTaskExportVerifyIn(BaseModel):
+    expected_signature: str = Field(min_length=16, max_length=200)
+    thread_limit: int = Field(default=2000, ge=1, le=5000)
+    decisions_limit: int = Field(default=500, ge=1, le=2000)
+    rounds_limit: int = Field(default=2000, ge=1, le=5000)
+
+
+class AgentTaskActionIn(BaseModel):
+    type: str = Field(min_length=1, max_length=50)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentTaskCreateIn(BaseModel):
     goal: str = Field(min_length=1, max_length=2000)
     scope_paths: list[str] = Field(default_factory=list, max_length=50)
     forbidden_paths: list[str] = Field(default_factory=list, max_length=50)
+    actions: list[AgentTaskActionIn] = Field(default_factory=list, max_length=100)
     acceptance_cmd: str = Field(min_length=1, max_length=1000)
+    working_dir: str | None = Field(default=None, max_length=2000)
     max_retry: int = Field(default=3, ge=1, le=5)
     dry_run: bool = False
+    rollback_on_action_failure: bool = True
+    actor_role: str = "coder_agent"
     auto_start: bool = True
 
 
@@ -1757,6 +1961,14 @@ def _task_public(task: dict[str, Any]) -> dict[str, Any]:
         "task_id": task.get("task_id"),
         "status": task.get("status"),
         "goal": task.get("goal"),
+        "scope_paths": list(task.get("scope_paths") or []),
+        "forbidden_paths": list(task.get("forbidden_paths") or []),
+        "acceptance_cmd": task.get("acceptance_cmd"),
+        "working_dir": task.get("working_dir"),
+        "actor_role": str(task.get("actor_role") or "coder_agent"),
+        "dry_run": bool(task.get("dry_run")),
+        "rollback_on_action_failure": bool(task.get("rollback_on_action_failure", True)),
+        "actions_count": len(list(task.get("actions") or [])),
         "request_id": task.get("request_id"),
         "trace_id": task.get("trace_id"),
         "current_step": task.get("current_step"),
@@ -1771,6 +1983,7 @@ def _task_public(task: dict[str, Any]) -> dict[str, Any]:
         "last_verify": task.get("last_verify"),
         "test_result": artifacts.get("test_result"),
         "summary": artifacts.get("summary"),
+        "step_results": list(artifacts.get("step_results") or []),
     }
 
 
@@ -1793,7 +2006,35 @@ def _persist_task(store: Storage | None, task: dict[str, Any]) -> None:
         fn(task)
     fn2 = getattr(store, "upsert_agent_task_artifacts", None)
     if callable(fn2):
-        fn2(str(task.get("task_id") or ""), task.get("artifacts") or {"changed_files": [], "test_result": None, "summary": ""})
+        fn2(str(task.get("task_id") or ""), task.get("artifacts") or {"changed_files": [], "step_results": [], "test_result": None, "summary": ""})
+
+
+def _task_step(
+    store: Storage | None,
+    task: dict[str, Any],
+    step_type: str,
+    inp: dict[str, Any],
+    out: dict[str, Any],
+    ok: bool,
+    latency_ms: int,
+) -> None:
+    seq = int(task.get("_step_seq") or 0) + 1
+    task["_step_seq"] = seq
+    attempt = int(task.get("attempt") or 0)
+    if store is None:
+        return
+    fn = getattr(store, "insert_agent_task_step", None)
+    if callable(fn):
+        fn(
+            str(task.get("task_id") or ""),
+            seq,
+            step_type,
+            attempt,
+            json.dumps(inp, ensure_ascii=False),
+            json.dumps(out, ensure_ascii=False),
+            ok,
+            latency_ms,
+        )
 
 
 def _normalize_task_error_code(code: object) -> str:
@@ -1805,6 +2046,15 @@ def _normalize_task_error_code(code: object) -> str:
         "COMMAND_NOT_ALLOWED": "COMMAND_NOT_ALLOWED",
         "COMMAND_TIMEOUT": "COMMAND_TIMEOUT",
         "COMMAND_FAILED": "COMMAND_FAILED",
+        "WORKING_DIR_NOT_ALLOWED": "WORKING_DIR_NOT_ALLOWED",
+        "PATH_NOT_ALLOWED": "PATH_NOT_ALLOWED",
+        "FILE_NOT_FOUND": "FILE_NOT_FOUND",
+        "FILE_PROTECTED": "FILE_PROTECTED",
+        "SEARCH_TARGET_NOT_FOUND": "SEARCH_TARGET_NOT_FOUND",
+        "ACTION_TYPE_NOT_ALLOWED": "ACTION_TYPE_NOT_ALLOWED",
+        "ACTION_ARGS_INVALID": "ACTION_ARGS_INVALID",
+        "ACTION_FAILED": "ACTION_FAILED",
+        "ROLE_PERMISSION_DENIED": "ROLE_PERMISSION_DENIED",
         "RETRY_EXHAUSTED": "RETRY_EXHAUSTED",
     }
     return mapping.get(c, "TASK_RUNTIME_ERROR")
@@ -1823,14 +2073,498 @@ def _task_not_found(task_id: str) -> HTTPException:
     return HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "task_id": task_id})
 
 
-def _run_acceptance_command(settings: Settings, command: str) -> dict[str, Any]:
+def _group_task_not_found(task_id: str) -> HTTPException:
+    return HTTPException(status_code=404, detail={"code": "GROUP_TASK_NOT_FOUND", "task_id": task_id})
+
+
+def _ensure_group_mode_enabled(settings: Settings) -> None:
+    if not bool(getattr(settings, "group_mode_enabled", True)):
+        raise HTTPException(status_code=503, detail={"code": "GROUP_MODE_DISABLED", "message": "group mode is disabled by AGUNT_GROUP_MODE_ENABLED"})
+
+
+def _group_task_public(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": task.get("task_id"),
+        "goal": task.get("goal"),
+        "owner_id": task.get("owner_id"),
+        "status": task.get("status"),
+        "phase": task.get("phase"),
+        "request_id": task.get("request_id"),
+        "trace_id": task.get("trace_id"),
+        "stop_reason": task.get("stop_reason"),
+        "error_code": task.get("error_code"),
+        "created_at_ms": task.get("created_at_ms"),
+        "updated_at_ms": task.get("updated_at_ms"),
+        "finished_at_ms": task.get("finished_at_ms"),
+    }
+
+
+def _group_round_no_from_phase(phase: str) -> int:
+    phase_v = str(phase or "").strip().lower()
+    if phase_v == GROUP_PHASE_PLANNING:
+        return 1
+    if phase_v == GROUP_PHASE_DISCUSSION:
+        return 2
+    if phase_v == GROUP_PHASE_EXECUTION:
+        return 3
+    if phase_v == GROUP_PHASE_QA_VERIFYING:
+        return 4
+    if phase_v == GROUP_PHASE_DECISION:
+        return 5
+    return 0
+
+
+def _write_group_round(store: Storage | None, task_id: str, phase: str, actor_role: str, note: str | None = None) -> None:
+    if store is None:
+        return
+    fn = getattr(store, "insert_group_task_round", None)
+    if callable(fn):
+        fn(task_id, _group_round_no_from_phase(phase), phase, actor_role, note)
+
+
+def _is_group_task_closed(task: dict[str, Any]) -> bool:
+    return str(task.get("status") or "") in {GROUP_STATUS_DONE, "cancelled"}
+
+
+def _normalize_group_phase(v: str) -> str:
+    p = str(v or "").strip().lower()
+    if p not in GROUP_PHASE_ALLOWED:
+        raise ValueError("GROUP_PHASE_NOT_ALLOWED")
+    return p
+
+
+def _group_status_from_phase(phase: str) -> str:
+    return (GROUP_STATUS_RUNNING if phase in GROUP_PHASE_RUNNING else GROUP_STATUS_CREATED)
+
+
+def _normalize_group_actor_role(actor_role: str | None) -> str:
+    raw = str(actor_role or "owner").strip().lower()
+    role_map = {
+        "owner": "owner",
+        "rd": "rd",
+        "qa": "qa",
+        "pm": "pm",
+        "ba": "ba",
+        "finance": "finance",
+        "thinktank": "thinktank",
+        "sme": "sme",
+        "coder_agent": "rd",
+        "reviewer_agent": "qa",
+    }
+    role = role_map.get(raw)
+    if not role:
+        raise ValueError("GROUP_ROLE_NOT_ALLOWED")
+    return role
+
+
+def _assert_group_role_can_approve(actor_role: str) -> None:
+    if actor_role != "owner":
+        raise ValueError("ROLE_PERMISSION_DENIED")
+
+
+def _assert_group_role_can_rerun(actor_role: str, phase: str) -> None:
+    if actor_role == "owner":
+        return
+    if phase == GROUP_PHASE_EXECUTION and actor_role == "rd":
+        return
+    if phase == GROUP_PHASE_QA_VERIFYING and actor_role == "qa":
+        return
+    raise ValueError("ROLE_PERMISSION_DENIED")
+
+
+def _assert_group_role_can_qa_review(actor_role: str) -> None:
+    if actor_role in {"qa", "owner"}:
+        return
+    raise ValueError("ROLE_PERMISSION_DENIED")
+
+
+def _assert_group_role_can_cancel(actor_role: str) -> None:
+    if actor_role == "owner":
+        return
+    raise ValueError("ROLE_PERMISSION_DENIED")
+
+
+def _assert_group_role_can_post_thread(actor_role: str) -> None:
+    if actor_role in {"owner", "pm", "rd", "qa", "ba", "finance", "thinktank", "sme"}:
+        return
+    raise ValueError("ROLE_PERMISSION_DENIED")
+
+
+def _assert_group_role_can_submit_execution(actor_role: str) -> None:
+    if actor_role in {"rd", "owner"}:
+        return
+    raise ValueError("ROLE_PERMISSION_DENIED")
+
+
+def _assert_group_owner_identity(task: dict[str, Any], owner_id: str | None) -> None:
+    expected = str(task.get("owner_id") or "").strip()
+    provided = str(owner_id or "").strip()
+    if expected and provided and expected != provided:
+        raise ValueError("GROUP_OWNER_MISMATCH")
+
+
+def _assert_group_role_can_upsert_artifacts(actor_role: str) -> None:
+    if actor_role in {"owner", "rd", "qa"}:
+        return
+    raise ValueError("ROLE_PERMISSION_DENIED")
+
+
+def _assert_group_phase_transition(current_phase: str, next_phase: str) -> None:
+    cur = _normalize_group_phase(current_phase)
+    nxt = _normalize_group_phase(next_phase)
+    if cur == nxt:
+        return
+    allowed_next = GROUP_PHASE_TRANSITIONS.get(cur) or set()
+    if nxt not in allowed_next:
+        raise ValueError(GROUP_ERROR_TRANSITION_NOT_ALLOWED)
+
+
+def _group_state_machine_view(task: dict[str, Any]) -> dict[str, Any]:
+    phase = str(task.get("phase") or GROUP_PHASE_PLANNING)
+    status = str(task.get("status") or GROUP_STATUS_CREATED)
+    closed = _is_group_task_closed(task)
+    allowed_next = sorted(list(GROUP_PHASE_TRANSITIONS.get(phase) or set()))
+    if closed:
+        allowed_next = []
+    can = {
+        "owner": {
+            "approve": (not closed and phase == GROUP_PHASE_DECISION),
+            "rerun": (not closed),
+            "cancel": (not closed),
+            "execution_submit": (not closed and phase == GROUP_PHASE_EXECUTION),
+            "qa_review": (not closed and phase == GROUP_PHASE_QA_VERIFYING),
+            "thread_message": (not closed),
+        },
+        "rd": {
+            "execution_submit": (not closed and phase == GROUP_PHASE_EXECUTION),
+            "rerun_to_execution": (not closed),
+            "thread_message": (not closed),
+        },
+        "qa": {
+            "qa_review": (not closed and phase == GROUP_PHASE_QA_VERIFYING),
+            "rerun_to_qa_verifying": (not closed),
+            "thread_message": (not closed),
+        },
+    }
+    return {"phase": phase, "status": status, "closed": closed, "allowed_next_phases": allowed_next, "capabilities": can}
+
+
+def _group_actions_for_role(task: dict[str, Any], actor_role: str) -> dict[str, Any]:
+    role = _normalize_group_actor_role(actor_role)
+    phase = str(task.get("phase") or GROUP_PHASE_PLANNING)
+    closed = _is_group_task_closed(task)
+    return {
+        "actor_role": role,
+        "closed": closed,
+        "approve": bool(role == "owner" and (not closed) and phase == GROUP_PHASE_DECISION),
+        "cancel": bool(role == "owner" and (not closed)),
+        "rerun_allowed": bool(
+            (role == "owner" and (not closed))
+            or (role == "rd" and (not closed))
+            or (role == "qa" and (not closed))
+        ),
+        "rerun_phases": (
+            ([GROUP_PHASE_DISCUSSION, GROUP_PHASE_EXECUTION, GROUP_PHASE_QA_VERIFYING] if role == "owner" else [GROUP_PHASE_EXECUTION] if role == "rd" else [GROUP_PHASE_QA_VERIFYING] if role == "qa" else [])
+            if not closed
+            else []
+        ),
+        "execution_submit": bool(role in {"owner", "rd"} and (not closed) and phase == GROUP_PHASE_EXECUTION),
+        "qa_review": bool(role in {"owner", "qa"} and (not closed) and phase == GROUP_PHASE_QA_VERIFYING),
+        "thread_message": bool((not closed) and role in {"owner", "pm", "rd", "qa", "ba", "finance", "thinktank", "sme"}),
+        "artifacts_update": bool(role in {"owner", "rd", "qa"} and (not closed)),
+    }
+
+
+def _group_quality_gate_ci(task_id: str, artifacts: dict[str, Any] | None) -> dict[str, Any]:
+    art = artifacts if isinstance(artifacts, dict) else {}
+    test_result_raw = str(art.get("test_result") or "").strip()
+    test_result = test_result_raw.lower()
+    changed_files = art.get("changed_files") if isinstance(art.get("changed_files"), list) else []
+    ok_set = {"qa_passed", "passed", "ok", "success", "green"}
+    qa_passed = test_result in ok_set
+    blocked_reasons: list[str] = []
+    if not qa_passed:
+        blocked_reasons.append("qa_review_not_passed")
+    return {
+        "task_id": task_id,
+        "status": ("ok" if not blocked_reasons else "fail"),
+        "pass": (len(blocked_reasons) == 0),
+        "blocked": (len(blocked_reasons) > 0),
+        "blocked_reasons": blocked_reasons,
+        "test_result": test_result_raw,
+        "changed_files_count": len(changed_files),
+        "summary_line": f"group_quality_gate: status={'ok' if not blocked_reasons else 'fail'} pass={str(len(blocked_reasons)==0).lower()} test_result={test_result_raw or 'none'} changed_files={len(changed_files)}",
+    }
+
+
+def _safe_project_path(settings: Settings, raw_path: str) -> Path:
+    root = Path(str(settings.project_root)).resolve()
+    p = Path(raw_path or ".")
+    target = (root / p).resolve() if not p.is_absolute() else p.resolve()
+    if root != target and root not in target.parents:
+        raise ValueError("PATH_NOT_ALLOWED")
+    return target
+
+
+def _normalize_task_paths(settings: Settings, paths: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for it in paths:
+        s = str(it or "").strip()
+        if not s:
+            continue
+        p = _safe_project_path(settings, s)
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _is_allowed_working_dir(cwd: Path, scope_paths: list[str], forbidden_paths: list[str]) -> bool:
+    for fp in forbidden_paths:
+        p = Path(fp)
+        if cwd == p or p in cwd.parents:
+            return False
+    if not scope_paths:
+        return True
+    for sp in scope_paths:
+        p = Path(sp)
+        if cwd == p or p in cwd.parents:
+            return True
+    return False
+
+
+def _is_allowed_target_path(p: Path, scope_paths: list[str], forbidden_paths: list[str]) -> bool:
+    for fp in forbidden_paths:
+        f = Path(fp)
+        if p == f or f in p.parents:
+            return False
+    for sp in scope_paths:
+        s = Path(sp)
+        if p == s or s in p.parents:
+            return True
+    return False
+
+
+def _is_default_protected_target_path(p: Path) -> bool:
+    name = p.name.lower()
+    if name == ".env" or name.startswith(".env."):
+        return True
+    for pat in _DEFAULT_PROTECTED_FILE_PATTERNS:
+        pp = pat.lower()
+        if pp in {".env", ".env."}:
+            continue
+        if pp.startswith(".") and name.endswith(pp):
+            return True
+        if pp in name:
+            return True
+    return False
+
+
+def _normalize_actor_role(actor_role: str | None) -> str:
+    r = str(actor_role or "coder_agent").strip().lower()
+    if r not in {"coder_agent", "reviewer_agent", "owner"}:
+        raise ValueError("ROLE_NOT_ALLOWED")
+    return r
+
+
+def _normalize_actions(actions: list[AgentTaskActionIn], actor_role: str = "coder_agent") -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    role = _normalize_actor_role(actor_role)
+    for a in actions:
+        t = str(a.type or "").strip().lower()
+        if t not in {"read_file", "write_file", "run_command", "search_replace"}:
+            raise ValueError("ACTION_TYPE_NOT_ALLOWED")
+        if role in {"reviewer_agent", "owner"} and t in {"write_file", "search_replace"}:
+            raise ValueError("ROLE_PERMISSION_DENIED")
+        out.append({"type": t, "params": dict(a.params or {})})
+    return out
+
+
+def _execute_task_actions(
+    settings: Settings,
+    actions: list[dict[str, Any]],
+    scope_paths: list[str],
+    forbidden_paths: list[str],
+    working_dir: str,
+    actor_role: str = "coder_agent",
+) -> dict[str, Any]:
+    changed_files: list[str] = []
+    action_logs: list[str] = []
+    step_results: list[dict[str, Any]] = []
+    backups: list[dict[str, Any]] = []
+    for idx, action in enumerate(actions, start=1):
+        action_started = _now_ms()
+        t = str(action.get("type") or "")
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        role_v = _normalize_actor_role(actor_role)
+        if role_v in {"reviewer_agent", "owner"} and t in {"write_file", "search_replace"}:
+            return _fail("ROLE_PERMISSION_DENIED", f"role {role_v} cannot execute {t}")
+
+        def _fail(code: str, message: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+            sr = {
+                "index": idx,
+                "type": t,
+                "ok": False,
+                "error_code": code,
+                "message": message[:500],
+                "latency_ms": max(0, _now_ms() - action_started),
+            }
+            if isinstance(extra, dict):
+                sr.update(extra)
+            step_results.append(sr)
+            return {"ok": False, "error_code": code, "message": message[:500], "step_results": step_results, "backups": backups}
+
+        if t == "read_file":
+            fp = str(params.get("file_path") or "").strip()
+            if not fp:
+                return _fail("ACTION_ARGS_INVALID", "read_file.file_path required")
+            try:
+                p = _safe_project_path(settings, fp)
+            except Exception:
+                return _fail("PATH_NOT_ALLOWED", "read_file path outside project")
+            if not _is_allowed_target_path(p, scope_paths, forbidden_paths):
+                return _fail("PATH_NOT_ALLOWED", "read_file path not in scope")
+            if not p.exists() or not p.is_file():
+                return _fail("FILE_NOT_FOUND", "read_file target not found")
+            _ = p.read_text(encoding="utf-8")
+            action_logs.append(f"action_{idx}:read_file:{p}")
+            step_results.append({"index": idx, "type": t, "ok": True, "file_path": str(p), "latency_ms": max(0, _now_ms() - action_started)})
+            continue
+
+        if t == "write_file":
+            fp = str(params.get("file_path") or "").strip()
+            content = params.get("content")
+            if not fp or not isinstance(content, str):
+                return _fail("ACTION_ARGS_INVALID", "write_file args invalid")
+            try:
+                p = _safe_project_path(settings, fp)
+            except Exception:
+                return _fail("PATH_NOT_ALLOWED", "write_file path outside project")
+            if not _is_allowed_target_path(p, scope_paths, forbidden_paths):
+                return _fail("PATH_NOT_ALLOWED", "write_file path not in scope")
+            if _is_default_protected_target_path(p):
+                return _fail("FILE_PROTECTED", "write_file target is protected by default policy")
+            prev_exists = p.exists() and p.is_file()
+            prev_content = (p.read_text(encoding="utf-8") if prev_exists else None)
+            backups.append({"type": "file", "file_path": str(p), "prev_exists": prev_exists, "prev_content": prev_content})
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(p.parent)) as tmp:
+                tmp.write(content)
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(p)
+            changed_files.append(str(p))
+            action_logs.append(f"action_{idx}:write_file:{p}")
+            step_results.append({"index": idx, "type": t, "ok": True, "file_path": str(p), "latency_ms": max(0, _now_ms() - action_started)})
+            continue
+
+        if t == "run_command":
+            cmd = str(params.get("command") or "").strip()
+            if not cmd:
+                return _fail("ACTION_ARGS_INVALID", "run_command.command required")
+            res = _run_acceptance_command(settings, cmd, working_dir, scope_paths, forbidden_paths)
+            action_logs.append(f"action_{idx}:run_command:{res.get('error_code') or 'OK'}")
+            ok = bool(res.get("ok"))
+            step_results.append({"index": idx, "type": t, "ok": ok, "command": cmd, "exit_code": res.get("exit_code"), "latency_ms": max(0, _now_ms() - action_started)})
+            if not ok:
+                return _fail(_normalize_task_error_code(res.get("error_code")), str(res.get("stderr") or "run_command failed"), {"command": cmd, "exit_code": res.get("exit_code")})
+            continue
+
+        if t == "search_replace":
+            fp = str(params.get("file_path") or "").strip()
+            old_str = params.get("old_str")
+            new_str = params.get("new_str")
+            if (not fp) or (not isinstance(old_str, str)) or (not isinstance(new_str, str)) or (old_str == ""):
+                return _fail("ACTION_ARGS_INVALID", "search_replace args invalid")
+            try:
+                p = _safe_project_path(settings, fp)
+            except Exception:
+                return _fail("PATH_NOT_ALLOWED", "search_replace path outside project")
+            if not _is_allowed_target_path(p, scope_paths, forbidden_paths):
+                return _fail("PATH_NOT_ALLOWED", "search_replace path not in scope")
+            if _is_default_protected_target_path(p):
+                return _fail("FILE_PROTECTED", "search_replace target is protected by default policy")
+            if not p.exists() or not p.is_file():
+                return _fail("FILE_NOT_FOUND", "search_replace target not found")
+            src = p.read_text(encoding="utf-8")
+            pos = src.find(old_str)
+            if pos < 0:
+                return _fail("SEARCH_TARGET_NOT_FOUND", "old_str not found", {"file_path": str(p)})
+            backups.append({"type": "file", "file_path": str(p), "prev_exists": True, "prev_content": src})
+            out = src[:pos] + new_str + src[pos + len(old_str) :]
+            with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(p.parent)) as tmp:
+                tmp.write(out)
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(p)
+            changed_files.append(str(p))
+            action_logs.append(f"action_{idx}:search_replace:{p}")
+            step_results.append({"index": idx, "type": t, "ok": True, "file_path": str(p), "latency_ms": max(0, _now_ms() - action_started)})
+            continue
+
+    return {"ok": True, "changed_files": changed_files, "logs": action_logs, "step_results": step_results, "backups": backups}
+
+
+def _rollback_action_backups(backups: list[dict[str, Any]]) -> list[str]:
+    logs: list[str] = []
+    for item in reversed(backups):
+        if not isinstance(item, dict) or item.get("type") != "file":
+            continue
+        p = Path(str(item.get("file_path") or ""))
+        prev_exists = bool(item.get("prev_exists"))
+        prev_content = item.get("prev_content")
+        try:
+            if prev_exists:
+                with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(p.parent)) as tmp:
+                    tmp.write(str(prev_content or ""))
+                    tmp_path = Path(tmp.name)
+                tmp_path.replace(p)
+                logs.append(f"rollback_restored:{p}")
+            else:
+                if p.exists() and p.is_file():
+                    p.unlink()
+                logs.append(f"rollback_deleted:{p}")
+        except Exception as e:
+            logs.append(f"rollback_failed:{p}:{e}")
+    return logs
+
+
+def _is_allowed_command_parts(parts: list[str]) -> tuple[bool, str]:
+    if not parts:
+        return False, "empty command"
+    b = parts[0]
+    if b in {"python", "python3"}:
+        if len(parts) >= 4 and parts[1] == "-m" and parts[2] == "unittest":
+            return True, ""
+        return False, "python_only_unittest_allowed"
+    if b == "pip":
+        if len(parts) == 4 and parts[1] == "install" and parts[2] == "-r" and parts[3] and not str(parts[3]).startswith("-"):
+            return True, ""
+        return False, "pip_only_install_requirements_allowed"
+    if b == "git":
+        if len(parts) == 2 and parts[1] == "status":
+            return True, ""
+        return False, "git_only_status_allowed"
+    return False, f"bin_not_allowed:{b}"
+
+
+def _run_acceptance_command(settings: Settings, command: str, working_dir: str, scope_paths: list[str], forbidden_paths: list[str]) -> dict[str, Any]:
+    if any(x in command for x in ["&&", "||", ";", "|", "`"]):
+        return {"ok": False, "error_code": "COMMAND_NOT_ALLOWED", "stdout": "", "stderr": "complex_shell_not_allowed", "exit_code": -1}
     parts = shlex.split(command)
     if not parts:
         return {"ok": False, "error_code": "COMMAND_EMPTY", "stdout": "", "stderr": "empty command", "exit_code": -1}
-    allowed_bins = {"python", "python3", "pip", "git"}
-    if parts[0] not in allowed_bins:
-        return {"ok": False, "error_code": "COMMAND_NOT_ALLOWED", "stdout": "", "stderr": f"bin_not_allowed:{parts[0]}", "exit_code": -1}
-    cwd = str(Path(str(settings.project_root)).resolve())
+    ok_cmd, deny_reason = _is_allowed_command_parts(parts)
+    if not ok_cmd:
+        return {"ok": False, "error_code": "COMMAND_NOT_ALLOWED", "stdout": "", "stderr": deny_reason, "exit_code": -1}
+    try:
+        cwd_path = _safe_project_path(settings, working_dir or ".")
+    except Exception:
+        return {"ok": False, "error_code": "WORKING_DIR_NOT_ALLOWED", "stdout": "", "stderr": "working_dir_outside_project", "exit_code": -1}
+    if not _is_allowed_working_dir(cwd_path, scope_paths, forbidden_paths):
+        return {"ok": False, "error_code": "WORKING_DIR_NOT_ALLOWED", "stdout": "", "stderr": "working_dir_not_in_scope_or_forbidden", "exit_code": -1}
+    cwd = str(cwd_path)
     try:
         proc = subprocess.run(parts, cwd=cwd, capture_output=True, text=True, timeout=120)
         return {
@@ -1855,6 +2589,7 @@ def _run_agent_task(task_id: str, settings: Settings, store: Storage | None = No
         task["current_step"] = "PLAN"
         task["updated_at_ms"] = _now_ms()
         _task_log(task, "plan_started", store)
+        _task_step(store, task, "PLAN", {"task_id": task_id}, {"status": "running"}, True, 0)
         _persist_task(store, task)
 
     while True:
@@ -1870,9 +2605,85 @@ def _run_agent_task(task_id: str, settings: Settings, store: Storage | None = No
             _task_log(task, f"verify_started_attempt_{attempt}", store)
             cmd = str(task.get("acceptance_cmd") or "")
             max_retry = int(task.get("max_retry") or 1)
+            dry_run = bool(task.get("dry_run"))
+            rollback_on_action_failure = bool(task.get("rollback_on_action_failure", True))
+            working_dir = str(task.get("working_dir") or ".")
+            scope_paths = list(task.get("scope_paths") or [])
+            forbidden_paths = list(task.get("forbidden_paths") or [])
+            actions = list(task.get("actions") or [])
+            actor_role = str(task.get("actor_role") or "coder_agent")
+            actions_done = bool(task.get("actions_done"))
             _persist_task(store, task)
 
-        verify = _run_acceptance_command(settings, cmd)
+        if not dry_run and (not actions_done):
+            with _AGENT_TASKS_LOCK:
+                task = _AGENT_TASKS.get(task_id)
+                if not isinstance(task, dict) or task.get("status") == "cancelled":
+                    return
+                task["current_step"] = "ACT"
+                task["updated_at_ms"] = _now_ms()
+                _task_log(task, "act_started", store)
+                _persist_task(store, task)
+
+            act_started = _now_ms()
+            act_res = _execute_task_actions(settings, actions, scope_paths, forbidden_paths, working_dir, actor_role=actor_role)
+            with _AGENT_TASKS_LOCK:
+                task = _AGENT_TASKS.get(task_id)
+                if not isinstance(task, dict) or task.get("status") == "cancelled":
+                    return
+                _task_step(
+                    store,
+                    task,
+                    "ACT",
+                    {"actions": actions, "working_dir": working_dir},
+                    {"ok": bool(act_res.get("ok")), "error_code": act_res.get("error_code"), "changed_files": act_res.get("changed_files") or [], "step_results": act_res.get("step_results") or []},
+                    bool(act_res.get("ok")),
+                    max(0, _now_ms() - act_started),
+                )
+                for sr in list(act_res.get("step_results") or []):
+                    idx = int(sr.get("index") or 0)
+                    stype = str(sr.get("type") or "unknown").upper()
+                    s_ok = bool(sr.get("ok"))
+                    s_latency = int(sr.get("latency_ms") or 0)
+                    _task_step(
+                        store,
+                        task,
+                        f"ACTION_{stype}",
+                        {"index": idx, "type": str(sr.get("type") or ""), "working_dir": working_dir},
+                        sr,
+                        s_ok,
+                        max(0, s_latency),
+                    )
+                if not bool(act_res.get("ok")):
+                    artifacts = task.setdefault("artifacts", {"changed_files": [], "step_results": [], "test_result": None, "summary": ""})
+                    artifacts["step_results"] = list(act_res.get("step_results") or [])
+                    if rollback_on_action_failure:
+                        for lg in _rollback_action_backups(list(act_res.get("backups") or [])):
+                            _task_log(task, lg, store)
+                    task["status"] = "failed"
+                    task["current_step"] = "FINISH"
+                    task["stop_reason"] = "action_failed"
+                    task["error_code"] = _normalize_task_error_code(act_res.get("error_code") or "ACTION_FAILED")
+                    task["finished_at_ms"] = _now_ms()
+                    artifacts["test_result"] = "failed"
+                    artifacts["summary"] = str(act_res.get("message") or "action failed")[:200]
+                    _task_log(task, "act_failed", store)
+                    _persist_task(store, task)
+                    return
+                task["actions_done"] = True
+                artifacts = task.setdefault("artifacts", {"changed_files": [], "step_results": [], "test_result": None, "summary": ""})
+                artifacts["changed_files"] = list(dict.fromkeys((artifacts.get("changed_files") or []) + list(act_res.get("changed_files") or [])))
+                artifacts["step_results"] = list(act_res.get("step_results") or [])
+                for m in list(act_res.get("logs") or []):
+                    _task_log(task, str(m), store)
+                _task_log(task, "act_finished", store)
+                _persist_task(store, task)
+
+        verify_started = _now_ms()
+        if dry_run:
+            verify = {"ok": True, "error_code": None, "stdout": "", "stderr": "", "exit_code": 0, "command": "<dry_run>", "cwd": working_dir}
+        else:
+            verify = _run_acceptance_command(settings, cmd, working_dir, scope_paths, forbidden_paths)
 
         with _AGENT_TASKS_LOCK:
             task = _AGENT_TASKS.get(task_id)
@@ -1880,7 +2691,8 @@ def _run_agent_task(task_id: str, settings: Settings, store: Storage | None = No
                 return
             task["last_verify"] = verify
             task["updated_at_ms"] = _now_ms()
-            artifacts = task.setdefault("artifacts", {"changed_files": [], "test_result": None, "summary": ""})
+            _task_step(store, task, "VERIFY", {"command": cmd, "working_dir": working_dir}, verify, bool(verify.get("ok")), max(0, _now_ms() - verify_started))
+            artifacts = task.setdefault("artifacts", {"changed_files": [], "step_results": [], "test_result": None, "summary": ""})
             if bool(verify.get("ok")):
                 task["status"] = "succeeded"
                 task["current_step"] = "FINISH"
@@ -1896,6 +2708,15 @@ def _run_agent_task(task_id: str, settings: Settings, store: Storage | None = No
                 task["status"] = "retrying"
                 task["current_step"] = "RETRY"
                 task["error_code"] = _normalize_task_error_code(verify.get("error_code") or "COMMAND_FAILED")
+                _task_step(
+                    store,
+                    task,
+                    "RETRY",
+                    {"attempt": attempt, "max_retry": max_retry, "error_code": task.get("error_code")},
+                    {"status": "retrying"},
+                    True,
+                    0,
+                )
                 _task_log(task, f"retrying_attempt_{attempt}", store)
                 _persist_task(store, task)
             else:
@@ -1915,16 +2736,39 @@ def _run_agent_task(task_id: str, settings: Settings, store: Storage | None = No
 def api_agent_task_create(request: Request, body: AgentTaskCreateIn) -> dict:
     task_id = f"task_{uuid.uuid4().hex[:12]}"
     now = _now_ms()
+    settings = _get_settings(request)
+    if not bool(getattr(settings, "agent_exec_enabled", True)):
+        raise HTTPException(status_code=503, detail={"code": "AGENT_EXEC_DISABLED", "message": "agent execution is disabled by AGUNT_AGENT_EXEC_ENABLED"})
+    try:
+        scope_paths = _normalize_task_paths(settings, list(body.scope_paths))
+        forbidden_paths = _normalize_task_paths(settings, list(body.forbidden_paths))
+        actor_role = _normalize_actor_role(body.actor_role)
+        actions = _normalize_actions(list(body.actions), actor_role=actor_role)
+        default_wd = "apps/server/src" if (Path(str(settings.project_root)).resolve() / "apps/server/src").exists() else "."
+        working_dir = str(_safe_project_path(settings, body.working_dir or default_wd))
+        if not scope_paths:
+            scope_paths = [str(Path(str(settings.project_root)).resolve())]
+        if not _is_allowed_working_dir(Path(working_dir), scope_paths, forbidden_paths):
+            raise ValueError("WORKING_DIR_NOT_ALLOWED")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"code": str(e), "message": "invalid task scope/working_dir"})
+
     task = {
         "task_id": task_id,
         "status": "queued",
         "goal": body.goal,
-        "scope_paths": list(body.scope_paths),
-        "forbidden_paths": list(body.forbidden_paths),
+        "scope_paths": scope_paths,
+        "forbidden_paths": forbidden_paths,
         "acceptance_cmd": body.acceptance_cmd,
+        "working_dir": working_dir,
         "max_retry": int(body.max_retry),
         "attempt": 0,
         "dry_run": bool(body.dry_run),
+        "rollback_on_action_failure": bool(body.rollback_on_action_failure),
+        "actor_role": actor_role,
+        "actions": actions,
+        "actions_done": False,
+        "_step_seq": 0,
         "current_step": "QUEUED",
         "request_id": task_id,
         "trace_id": task_id,
@@ -1935,7 +2779,7 @@ def api_agent_task_create(request: Request, body: AgentTaskCreateIn) -> dict:
         "finished_at_ms": None,
         "logs": [],
         "last_verify": None,
-        "artifacts": {"changed_files": [], "test_result": None, "summary": ""},
+        "artifacts": {"changed_files": [], "step_results": [], "test_result": None, "summary": ""},
     }
     _task_log(task, "task_created", _get_store(request))
     with _AGENT_TASKS_LOCK:
@@ -1945,7 +2789,6 @@ def api_agent_task_create(request: Request, body: AgentTaskCreateIn) -> dict:
     _persist_task(store, task)
 
     if body.auto_start:
-        settings = _get_settings(request)
         th = threading.Thread(target=_run_agent_task, args=(task_id, settings, store), daemon=True)
         th.start()
     return {"ok": True, **_task_public(task)}
@@ -1961,7 +2804,7 @@ def api_agent_tasks(request: Request, limit: int = 50) -> dict:
         out: list[dict[str, Any]] = []
         for t in rows:
             task = dict(t)
-            task["artifacts"] = (fn_art(task.get("task_id")) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+            task["artifacts"] = (fn_art(task.get("task_id")) if callable(fn_art) else None) or {"changed_files": [], "step_results": [], "test_result": None, "summary": ""}
             fn_logs = getattr(store, "list_agent_task_logs", None)
             if callable(fn_logs):
                 task["logs"] = fn_logs(str(task.get("task_id") or ""), limit=500)
@@ -1981,7 +2824,7 @@ def api_agent_task_get(request: Request, task_id: str) -> dict:
         task = fn(task_id)
         if isinstance(task, dict):
             fn_art = getattr(store, "get_agent_task_artifacts", None)
-            task["artifacts"] = (fn_art(task_id) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+            task["artifacts"] = (fn_art(task_id) if callable(fn_art) else None) or {"changed_files": [], "step_results": [], "test_result": None, "summary": ""}
             fn_logs = getattr(store, "list_agent_task_logs", None)
             if callable(fn_logs):
                 task["logs"] = fn_logs(task_id, limit=500)
@@ -1993,6 +2836,1878 @@ def api_agent_task_get(request: Request, task_id: str) -> dict:
         return {"ok": True, **_task_public(task)}
 
 
+@router.post("/api/group/tasks")
+def api_group_task_create(request: Request, body: GroupTaskCreateIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    task_id = f"gtask_{uuid.uuid4().hex[:12]}"
+    now = _now_ms()
+    task = {
+        "task_id": task_id,
+        "goal": body.goal,
+        "owner_id": body.owner_id,
+        "status": GROUP_STATUS_CREATED,
+        "phase": GROUP_PHASE_PLANNING,
+        "request_id": task_id,
+        "trace_id": task_id,
+        "stop_reason": None,
+        "error_code": None,
+        "created_at_ms": now,
+        "updated_at_ms": now,
+        "finished_at_ms": None,
+    }
+    store = _get_store(request)
+    fn = getattr(store, "insert_group_task", None)
+    if not callable(fn):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    fn(task)
+    _write_group_round(store, task_id, str(task.get("phase") or GROUP_PHASE_PLANNING), "owner", "task_created")
+
+    fn_msg = getattr(store, "insert_group_agent_message", None)
+    if callable(fn_msg):
+        fn_msg(task_id, 0, "system", "system", "group task created", "{}")
+
+    fn_art = getattr(store, "upsert_group_artifacts", None)
+    if callable(fn_art):
+        fn_art(task_id, {"changed_files": [], "test_result": None, "summary": ""})
+
+    return {"ok": True, **_group_task_public(task)}
+
+
+@router.get("/api/group/tasks")
+def api_group_tasks(request: Request, limit: int = 50, status: str | None = None, phase: str | None = None, owner_id: str | None = None, cursor_updated_at_ms: int | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn = getattr(store, "list_group_tasks", None)
+    if not callable(fn):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+
+    limit_v = max(1, min(int(limit), 200))
+    status_v = (str(status).strip() if status is not None else None)
+    phase_v = (str(phase).strip() if phase is not None else None)
+    owner_v = (str(owner_id).strip() if owner_id is not None else None)
+    cursor_v = (None if cursor_updated_at_ms is None else int(cursor_updated_at_ms))
+
+    rows = fn(limit=limit_v, status=status_v, phase=phase_v, owner_id=owner_v, cursor_updated_at_ms=cursor_v) or []
+    items = [_group_task_public(dict(r)) for r in rows]
+
+    by_status: dict[str, int] = {}
+    for it in items:
+        st = str(it.get("status") or "unknown")
+        by_status[st] = int(by_status.get(st) or 0) + 1
+
+    next_cursor = None
+    if len(items) == limit_v and items:
+        last_updated = items[-1].get("updated_at_ms")
+        if isinstance(last_updated, int):
+            next_cursor = last_updated
+
+    return {
+        "ok": True,
+        "items": items,
+        "total": len(items),
+        "stats": {"by_status": by_status},
+        "filters": {"status": status_v, "phase": phase_v, "owner_id": owner_v},
+        "paging": {"limit": limit_v, "cursor_updated_at_ms": cursor_v, "next_cursor_updated_at_ms": next_cursor},
+    }
+
+
+@router.get("/api/group/tasks/metrics")
+def api_group_tasks_metrics(request: Request, owner_id: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn = getattr(store, "aggregate_group_tasks", None)
+    if callable(fn):
+        metrics = fn(owner_id=(str(owner_id).strip() if owner_id is not None else None))
+        return {"ok": True, "metrics": metrics}
+
+    fn_list = getattr(store, "list_group_tasks", None)
+    if not callable(fn_list):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    rows = fn_list(limit=200, status=None, phase=None, owner_id=(str(owner_id).strip() if owner_id is not None else None), cursor_updated_at_ms=None) or []
+    by_status: dict[str, int] = {}
+    by_phase: dict[str, int] = {}
+    by_owner: dict[str, int] = {}
+    for r in rows:
+        st = str(r.get("status") or "unknown")
+        ph = str(r.get("phase") or "unknown")
+        ow = str(r.get("owner_id") or "")
+        by_status[st] = int(by_status.get(st) or 0) + 1
+        by_phase[ph] = int(by_phase.get(ph) or 0) + 1
+        by_owner[ow] = int(by_owner.get(ow) or 0) + 1
+    return {"ok": True, "metrics": {"total": len(rows), "by_status": by_status, "by_phase": by_phase, "by_owner": [{"owner_id": k, "count": v} for k, v in sorted(by_owner.items(), key=lambda x: (-x[1], x[0]))[:20]]}}
+
+
+@router.get("/api/group/tasks/{task_id}/phase-history")
+def api_group_task_phase_history(request: Request, task_id: str, limit: int = 2000) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_rounds = getattr(store, "list_group_task_rounds", None)
+    if not callable(fn_rounds):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+
+    rows = fn_rounds(task_id, limit=max(1, min(int(limit), 5000)), cursor=None, order="asc") or []
+    items: list[dict[str, Any]] = []
+    prev_phase = None
+    for r in rows:
+        phase = str(r.get("phase") or "")
+        if phase != prev_phase:
+            items.append({
+                "phase": phase,
+                "at_ms": int(r.get("created_at_ms") or 0),
+                "actor_role": str(r.get("actor_role") or ""),
+                "note": str(r.get("note") or ""),
+            })
+            prev_phase = phase
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "current_phase": str(task.get("phase") or ""),
+        "total_rounds": len(rows),
+        "phase_changes": items,
+    }
+
+
+@router.get("/api/group/meta")
+def api_group_meta(request: Request) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    return {
+        "ok": True,
+        "phases": [GROUP_PHASE_PLANNING, GROUP_PHASE_DISCUSSION, GROUP_PHASE_EXECUTION, GROUP_PHASE_QA_VERIFYING, GROUP_PHASE_DECISION],
+        "statuses": [GROUP_STATUS_CREATED, GROUP_STATUS_RUNNING, GROUP_STATUS_DONE, "cancelled"],
+        "decision_types": [GROUP_DECISION_TYPE_APPROVE, GROUP_DECISION_TYPE_CANCEL],
+        "limits": {
+            "thread_limit_max": 5000,
+            "rounds_limit_max": 5000,
+            "decisions_limit_max": 2000,
+            "changed_files_max": 500,
+            "summary_max": 8000,
+        },
+        "roles": ["owner", "pm", "rd", "qa", "ba", "finance", "thinktank", "sme"],
+        "phase_transitions": GROUP_PHASE_TRANSITIONS,
+    }
+
+
+@router.get("/api/group/transitions")
+def api_group_transitions(request: Request) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    role_next_phases = {
+        "owner": [GROUP_PHASE_DISCUSSION, GROUP_PHASE_EXECUTION, GROUP_PHASE_QA_VERIFYING, GROUP_PHASE_DECISION],
+        "rd": [GROUP_PHASE_EXECUTION],
+        "qa": [GROUP_PHASE_QA_VERIFYING],
+        "pm": [],
+        "ba": [],
+        "finance": [],
+        "thinktank": [],
+        "sme": [],
+    }
+    return {"ok": True, "phase_transitions": GROUP_PHASE_TRANSITIONS, "role_next_phases": role_next_phases}
+
+
+class GroupTasksBatchSummaryIn(BaseModel):
+    task_ids: list[str] = Field(default_factory=list, max_length=200)
+    actor_role: str = Field(default="owner", min_length=1, max_length=64)
+
+
+class GroupTasksBatchHealthIn(BaseModel):
+    task_ids: list[str] = Field(default_factory=list, max_length=200)
+
+
+class GroupTasksBatchKpiIn(BaseModel):
+    task_ids: list[str] = Field(default_factory=list, max_length=200)
+    owner_id: str | None = None
+
+
+@router.post("/api/group/tasks/health:batch")
+def api_group_tasks_health_batch(request: Request, body: GroupTasksBatchHealthIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_get = getattr(store, "get_group_task", None)
+    fn_art = getattr(store, "get_group_artifacts", None)
+    fn_thread = getattr(store, "list_group_agent_messages", None)
+    fn_decisions = getattr(store, "list_group_decisions", None)
+    fn_rounds = getattr(store, "list_group_task_rounds", None)
+    if not callable(fn_get):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+
+    ids = [str(x).strip() for x in list(body.task_ids or []) if str(x).strip()][:200]
+    items: list[dict[str, Any]] = []
+    for tid in ids:
+        task = fn_get(tid)
+        if not isinstance(task, dict):
+            continue
+        artifacts = (fn_art(tid) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+        quality_gate_ci = _group_quality_gate_ci(tid, artifacts)
+        phase = str(task.get("phase") or "")
+        closed = _is_group_task_closed(task)
+        has_thread = bool((fn_thread(tid, limit=1, cursor=None, order="asc", role=None) if callable(fn_thread) else []) or [])
+        has_decisions = bool((fn_decisions(tid, limit=1, cursor=None, order="asc") if callable(fn_decisions) else []) or [])
+        has_rounds = bool((fn_rounds(tid, limit=1, cursor=None, order="asc") if callable(fn_rounds) else []) or [])
+        approve_ready = bool((phase == GROUP_PHASE_DECISION) and (not closed) and (not bool(quality_gate_ci.get("blocked"))))
+        blockers: list[str] = []
+        if closed:
+            blockers.append("GROUP_TASK_CLOSED")
+        if bool(quality_gate_ci.get("blocked")):
+            blockers.append(GROUP_ERROR_QUALITY_GATE_BLOCKED)
+        if not has_thread:
+            blockers.append("GROUP_EXPORT_THREAD_EMPTY")
+        if not has_decisions:
+            blockers.append("GROUP_EXPORT_DECISIONS_EMPTY")
+        if not has_rounds:
+            blockers.append("GROUP_EXPORT_ROUNDS_EMPTY")
+        items.append({"task_id": tid, "phase": phase, "status": str(task.get("status") or ""), "approve_ready": approve_ready, "blockers": blockers})
+
+    return {"ok": True, "total": len(items), "items": items}
+
+
+@router.post("/api/group/tasks/summary:batch")
+def api_group_tasks_summary_batch(request: Request, body: GroupTasksBatchSummaryIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_get = getattr(store, "get_group_task", None)
+    fn_art = getattr(store, "get_group_artifacts", None)
+    if not callable(fn_get):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+
+    actor_role = _normalize_group_actor_role(body.actor_role)
+    items: list[dict[str, Any]] = []
+    ids = [str(x).strip() for x in list(body.task_ids or []) if str(x).strip()]
+    ids = ids[:200]
+    for tid in ids:
+        task = fn_get(tid)
+        if not isinstance(task, dict):
+            continue
+        artifacts = (fn_art(tid) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+        quality_gate_ci = _group_quality_gate_ci(tid, artifacts)
+        approve_ready = bool(
+            (str(task.get("phase") or "") == GROUP_PHASE_DECISION)
+            and (not _is_group_task_closed(task))
+            and (not bool(quality_gate_ci.get("blocked")))
+        )
+        items.append({
+            "task": _group_task_public(task),
+            "kpi": {
+                "changed_files_count": len(list(artifacts.get("changed_files") or [])),
+                "quality_gate_pass": not bool(quality_gate_ci.get("blocked")),
+                "approve_ready": approve_ready,
+            },
+            "actions": _group_actions_for_role(task, actor_role),
+        })
+
+    return {"ok": True, "actor_role": actor_role, "total": len(items), "items": items}
+
+
+@router.get("/api/group/tasks/summary")
+def api_group_tasks_summary(request: Request, limit: int = 20, status: str | None = None, phase: str | None = None, owner_id: str | None = None, actor_role: str = "owner") -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+
+    try:
+        role_v = _normalize_group_actor_role(actor_role)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"code": str(e), "actor_role": str(actor_role or "")})
+
+    rows = list_group_tasks_or_raise(
+        store,
+        limit=limit,
+        status=status,
+        phase=phase,
+        owner_id=owner_id,
+    )
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        task = dict(row)
+        task_id = str(task.get("task_id") or "")
+        artifacts = get_group_artifacts_or_default(store, task_id)
+        qg = _group_quality_gate_ci(task_id, artifacts)
+        out.append(
+            {
+                "task": _group_task_public(task),
+                "kpi": {
+                    "changed_files_count": len(list(artifacts.get("changed_files") or [])),
+                    "quality_gate_pass": bool(qg.get("pass")),
+                    "approve_ready": bool((str(task.get("phase") or "") == GROUP_PHASE_DECISION) and (not _is_group_task_closed(task)) and (not bool(qg.get("blocked")))),
+                },
+                "actions": _group_actions_for_role(task, role_v),
+            }
+        )
+
+    return {"ok": True, "items": out, "total": len(out), "actor_role": role_v}
+
+
+@router.get("/api/group/tasks/{task_id}")
+def api_group_task_get(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+    return {"ok": True, **_group_task_public(task)}
+
+
+@router.get("/api/group/tasks/{task_id}/state-machine")
+def api_group_task_state_machine(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+    return {"ok": True, "task_id": task_id, "state_machine": _group_state_machine_view(task)}
+
+
+@router.get("/api/group/tasks/{task_id}/actions")
+def api_group_task_actions(request: Request, task_id: str, actor_role: str = "owner") -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+    try:
+        actions = _group_actions_for_role(task, actor_role)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"code": str(e), "actor_role": str(actor_role or "")})
+    return {"ok": True, "task_id": task_id, "phase": str(task.get("phase") or ""), "status": str(task.get("status") or ""), "actions": actions}
+
+
+@router.post("/api/group/tasks/{task_id}/thread/messages:precheck")
+def api_group_task_thread_message_precheck(request: Request, task_id: str, body: GroupTaskThreadMessageIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_thread_message_precheck(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_post_thread=_assert_group_role_can_post_thread,
+        is_closed=_is_group_task_closed,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/thread/messages")
+def api_group_task_thread_message(request: Request, task_id: str, body: GroupTaskThreadMessageIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_put = getattr(store, "insert_group_task", None)
+    if not callable(fn_put):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    return handle_group_task_thread_message(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_post_thread=_assert_group_role_can_post_thread,
+        status_done=GROUP_STATUS_DONE,
+        status_cancelled="cancelled",
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+        phase_planning=GROUP_PHASE_PLANNING,
+        phase_discussion=GROUP_PHASE_DISCUSSION,
+        status_created=GROUP_STATUS_CREATED,
+        now_ms=_now_ms,
+        put_task=lambda _, t: fn_put(t),
+        write_round=_write_group_round,
+        public_task=_group_task_public,
+    )
+
+
+@router.get("/api/group/tasks/{task_id}/thread")
+def api_group_task_thread(request: Request, task_id: str, limit: int = 500, cursor: int | None = None, order: str = "asc", role: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    _ = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+
+    limit_v = max(1, min(int(limit), 2000))
+    order_v = ("desc" if str(order).strip().lower() == "desc" else "asc")
+    cursor_v = (None if cursor is None else int(cursor))
+    role_v = (str(role).strip() if role is not None and str(role).strip() else None)
+
+    fn = getattr(store, "list_group_agent_messages", None)
+    if not callable(fn):
+        return {"ok": True, "task_id": task_id, "items": [], "paging": {"limit": limit_v, "order": order_v, "cursor": cursor_v, "next_cursor": None, "role": role_v}}
+
+    items = fn(task_id, limit=limit_v, cursor=cursor_v, order=order_v, role=role_v)
+    next_cursor = None
+    if len(items) == limit_v and items:
+        last_cursor = items[-1].get("_cursor")
+        if isinstance(last_cursor, int):
+            next_cursor = last_cursor
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "items": items,
+        "paging": {"limit": limit_v, "order": order_v, "cursor": cursor_v, "next_cursor": next_cursor, "role": role_v},
+    }
+
+
+@router.get("/api/group/tasks/{task_id}/artifacts")
+def api_group_task_artifacts(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    _ = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+    artifacts = get_group_artifacts_or_default(store, task_id)
+    return {"ok": True, "task_id": task_id, "artifacts": artifacts}
+
+
+@router.post("/api/group/tasks/{task_id}/artifacts/update:precheck")
+def api_group_task_artifacts_update_precheck(request: Request, task_id: str, body: GroupTaskArtifactsUpsertIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_artifacts_update_precheck(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_upsert_artifacts=_assert_group_role_can_upsert_artifacts,
+        is_closed=_is_group_task_closed,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/artifacts/update")
+def api_group_task_artifacts_update(request: Request, task_id: str, body: GroupTaskArtifactsUpsertIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_artifacts_update(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        get_artifacts_default=get_group_artifacts_or_default,
+        is_closed=_is_group_task_closed,
+        normalize_role=_normalize_group_actor_role,
+        assert_can_upsert_artifacts=_assert_group_role_can_upsert_artifacts,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+        round_no_from_phase=_group_round_no_from_phase,
+    )
+
+
+@router.get("/api/group/tasks/{task_id}/rounds")
+def api_group_task_rounds(request: Request, task_id: str, limit: int = 500, cursor: int | None = None, order: str = "asc") -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    _ = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+
+    limit_v = max(1, min(int(limit), 2000))
+    order_v = ("desc" if str(order).strip().lower() == "desc" else "asc")
+    cursor_v = (None if cursor is None else int(cursor))
+
+    fn = getattr(store, "list_group_task_rounds", None)
+    items = (fn(task_id, limit=limit_v, cursor=cursor_v, order=order_v) if callable(fn) else []) or []
+    next_cursor = None
+    if len(items) == limit_v and items:
+        last_cursor = items[-1].get("_cursor")
+        if isinstance(last_cursor, int):
+            next_cursor = last_cursor
+
+    return {"ok": True, "task_id": task_id, "items": items, "paging": {"limit": limit_v, "order": order_v, "cursor": cursor_v, "next_cursor": next_cursor}}
+
+
+@router.get("/api/group/tasks/{task_id}/decisions")
+def api_group_task_decisions(request: Request, task_id: str, limit: int = 100, cursor: int | None = None, order: str = "asc") -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    _ = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+
+    limit_v = max(1, min(int(limit), 2000))
+    order_v = ("desc" if str(order).strip().lower() == "desc" else "asc")
+    cursor_v = (None if cursor is None else int(cursor))
+
+    fn = getattr(store, "list_group_decisions", None)
+    items = (fn(task_id, limit=limit_v, cursor=cursor_v, order=order_v) if callable(fn) else []) or []
+    next_cursor = None
+    if len(items) == limit_v and items:
+        last_cursor = items[-1].get("_cursor")
+        if isinstance(last_cursor, int):
+            next_cursor = last_cursor
+
+    return {"ok": True, "task_id": task_id, "items": items, "paging": {"limit": limit_v, "order": order_v, "cursor": cursor_v, "next_cursor": next_cursor}}
+
+
+@router.get("/api/group/tasks/{task_id}/timeline")
+def api_group_task_timeline(request: Request, task_id: str, rounds_limit: int = 200, thread_limit: int = 200, decisions_limit: int = 100) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+
+    fn_rounds = getattr(store, "list_group_task_rounds", None)
+    rounds = (fn_rounds(task_id, limit=max(1, min(int(rounds_limit), 2000)), cursor=None, order="asc") if callable(fn_rounds) else []) or []
+
+    fn_thread = getattr(store, "list_group_agent_messages", None)
+    thread = (fn_thread(task_id, limit=max(1, min(int(thread_limit), 2000)), cursor=None, order="asc", role=None) if callable(fn_thread) else []) or []
+
+    fn_decisions = getattr(store, "list_group_decisions", None)
+    decisions = (fn_decisions(task_id, limit=max(1, min(int(decisions_limit), 1000)), cursor=None, order="asc") if callable(fn_decisions) else []) or []
+
+    last_round = (rounds[-1] if rounds else None)
+    last_message = (thread[-1] if thread else None)
+    last_decision = (decisions[-1] if decisions else None)
+
+    return {
+        "ok": True,
+        "task": _group_task_public(task),
+        "counts": {"rounds": len(rounds), "thread": len(thread), "decisions": len(decisions)},
+        "last": {"round": last_round, "message": last_message, "decision": last_decision},
+        "rounds": rounds,
+        "thread": thread,
+        "decisions": decisions,
+    }
+
+
+@router.get("/api/group/tasks/{task_id}/export")
+def api_group_task_export(request: Request, task_id: str, thread_limit: int = 2000, decisions_limit: int = 500, rounds_limit: int = 2000) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_export(
+        task_id=task_id,
+        thread_limit=thread_limit,
+        decisions_limit=decisions_limit,
+        rounds_limit=rounds_limit,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        get_artifacts=get_group_artifacts_or_default,
+        public_task=_group_task_public,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/export/verify")
+def api_group_task_export_verify(request: Request, task_id: str, body: GroupTaskExportVerifyIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    out = api_group_task_export(
+        request=request,
+        task_id=task_id,
+        thread_limit=int(body.thread_limit),
+        decisions_limit=int(body.decisions_limit),
+        rounds_limit=int(body.rounds_limit),
+    )
+    actual = str(out.get("export_signature") or "")
+    expected = str(body.expected_signature or "").strip().lower()
+    matched = bool(actual) and (actual == expected)
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "matched": matched,
+        "expected_signature": expected,
+        "actual_signature": actual,
+        "signature_algo": str(out.get("export_signature_algo") or "sha256-stable-json-v1"),
+    }
+
+
+@router.get("/api/group/tasks/{task_id}/audit")
+def api_group_task_audit(request: Request, task_id: str, thread_limit: int = 2000, decisions_limit: int = 500, rounds_limit: int = 2000) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_audit(
+        task_id=task_id,
+        thread_limit=thread_limit,
+        decisions_limit=decisions_limit,
+        rounds_limit=rounds_limit,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        get_artifacts=get_group_artifacts_or_default,
+        public_task=_group_task_public,
+    )
+
+
+@router.get("/api/group/tasks/{task_id}/trace-map")
+def api_group_task_trace_map(request: Request, task_id: str, limit: int = 5000) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_trace_map(
+        task_id=task_id,
+        limit=limit,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+    )
+
+
+@router.get("/api/group/tasks/{task_id}/audit-closure")
+def api_group_task_audit_closure(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    export_out = api_group_task_export(request, task_id, thread_limit=2000, decisions_limit=500, rounds_limit=2000)
+    audit_out = api_group_task_audit(request, task_id, thread_limit=2000, decisions_limit=500, rounds_limit=2000)
+    trace_out = api_group_task_trace_map(request, task_id, limit=5000)
+    return handle_group_task_audit_closure(task_id=task_id, export_out=export_out, audit_out=audit_out, trace_out=trace_out)
+
+
+@router.get("/api/group/tasks/{task_id}/readiness")
+def api_group_task_readiness(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+
+    fn_art = getattr(store, "get_group_artifacts", None)
+    fn_thread = getattr(store, "list_group_agent_messages", None)
+    fn_decisions = getattr(store, "list_group_decisions", None)
+    fn_rounds = getattr(store, "list_group_task_rounds", None)
+
+    artifacts = (fn_art(task_id) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+    quality_gate_ci = _group_quality_gate_ci(task_id, artifacts)
+
+    closed = _is_group_task_closed(task)
+    phase = str(task.get("phase") or "")
+    status = str(task.get("status") or "")
+
+    has_thread = bool((fn_thread(task_id, limit=1, cursor=None, order="asc", role=None) if callable(fn_thread) else []) or [])
+    has_decisions = bool((fn_decisions(task_id, limit=1, cursor=None, order="asc") if callable(fn_decisions) else []) or [])
+    has_rounds = bool((fn_rounds(task_id, limit=1, cursor=None, order="asc") if callable(fn_rounds) else []) or [])
+
+    approve_ready = bool((phase == GROUP_PHASE_DECISION) and (not closed) and (not bool(quality_gate_ci.get("blocked"))))
+    qa_review_ready = bool((phase == GROUP_PHASE_QA_VERIFYING) and (not closed))
+    execution_submit_ready = bool((phase == GROUP_PHASE_EXECUTION) and (not closed))
+    export_ready = bool((not bool(quality_gate_ci.get("blocked"))) and has_thread and has_decisions and has_rounds)
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "phase": phase,
+        "status": status,
+        "closed": closed,
+        "quality_gate_ci": quality_gate_ci,
+        "readiness": {
+            "execution_submit_ready": execution_submit_ready,
+            "qa_review_ready": qa_review_ready,
+            "approve_ready": approve_ready,
+            "export_ready": export_ready,
+        },
+        "signals": {"has_thread": has_thread, "has_decisions": has_decisions, "has_rounds": has_rounds},
+    }
+
+
+@router.get("/api/group/tasks/{task_id}/blockers")
+def api_group_task_blockers(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+
+    fn_art = getattr(store, "get_group_artifacts", None)
+    fn_thread = getattr(store, "list_group_agent_messages", None)
+    fn_decisions = getattr(store, "list_group_decisions", None)
+    fn_rounds = getattr(store, "list_group_task_rounds", None)
+
+    artifacts = (fn_art(task_id) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+    quality_gate_ci = _group_quality_gate_ci(task_id, artifacts)
+    closed = _is_group_task_closed(task)
+    phase = str(task.get("phase") or "")
+
+    has_thread = bool((fn_thread(task_id, limit=1, cursor=None, order="asc", role=None) if callable(fn_thread) else []) or [])
+    has_decisions = bool((fn_decisions(task_id, limit=1, cursor=None, order="asc") if callable(fn_decisions) else []) or [])
+    has_rounds = bool((fn_rounds(task_id, limit=1, cursor=None, order="asc") if callable(fn_rounds) else []) or [])
+
+    blockers: dict[str, list[str]] = {
+        "execution_submit": [],
+        "qa_review": [],
+        "approve": [],
+        "export": [],
+    }
+    if closed:
+        for k in blockers.keys():
+            blockers[k].append("GROUP_TASK_CLOSED")
+
+    if phase != GROUP_PHASE_EXECUTION:
+        blockers["execution_submit"].append("GROUP_EXECUTION_PHASE_INVALID")
+    if phase != GROUP_PHASE_QA_VERIFYING:
+        blockers["qa_review"].append(GROUP_ERROR_QA_PHASE_INVALID)
+    if phase != GROUP_PHASE_DECISION:
+        blockers["approve"].append(GROUP_ERROR_APPROVE_PHASE_INVALID)
+
+    if bool(quality_gate_ci.get("blocked")):
+        blockers["approve"].append(GROUP_ERROR_QUALITY_GATE_BLOCKED)
+        blockers["export"].append(GROUP_ERROR_QUALITY_GATE_BLOCKED)
+    if not has_thread:
+        blockers["export"].append("GROUP_EXPORT_THREAD_EMPTY")
+    if not has_decisions:
+        blockers["export"].append("GROUP_EXPORT_DECISIONS_EMPTY")
+    if not has_rounds:
+        blockers["export"].append("GROUP_EXPORT_ROUNDS_EMPTY")
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "phase": phase,
+        "closed": closed,
+        "blockers": blockers,
+        "quality_gate_ci": quality_gate_ci,
+    }
+
+
+@router.get("/api/group/tasks/{task_id}/integrity")
+def api_group_task_integrity(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+
+    fn_thread = getattr(store, "list_group_agent_messages", None)
+    fn_decisions = getattr(store, "list_group_decisions", None)
+    fn_rounds = getattr(store, "list_group_task_rounds", None)
+
+    thread_items = (fn_thread(task_id, limit=5000, cursor=None, order="asc", role=None) if callable(fn_thread) else []) or []
+    decision_items = (fn_decisions(task_id, limit=2000, cursor=None, order="asc") if callable(fn_decisions) else []) or []
+    rounds_items = (fn_rounds(task_id, limit=5000, cursor=None, order="asc") if callable(fn_rounds) else []) or []
+    artifacts = get_group_artifacts_or_default(store, task_id)
+
+    payload = {"task": _group_task_public(task), "thread": thread_items, "rounds": rounds_items, "decisions": decision_items, "artifacts": artifacts}
+    integrity_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    phase = str(task.get("phase") or "")
+    status = str(task.get("status") or "")
+    closed = _is_group_task_closed(task)
+    quality_gate_ci = _group_quality_gate_ci(task_id, artifacts)
+    phase_valid = phase in GROUP_PHASE_ALLOWED
+    status_valid = status in {GROUP_STATUS_CREATED, GROUP_STATUS_RUNNING, GROUP_STATUS_DONE, "cancelled"}
+    closed_consistent = (closed and status in {GROUP_STATUS_DONE, "cancelled"}) or ((not closed) and status in {GROUP_STATUS_CREATED, GROUP_STATUS_RUNNING})
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "integrity_hash": integrity_hash,
+        "integrity_hash_algo": "sha256-stable-json-v1",
+        "signals": {
+            "phase_valid": phase_valid,
+            "status_valid": status_valid,
+            "closed_consistent": closed_consistent,
+            "has_thread": len(thread_items) > 0,
+            "has_decisions": len(decision_items) > 0,
+            "has_rounds": len(rounds_items) > 0,
+            "quality_gate_blocked": bool(quality_gate_ci.get("blocked")),
+        },
+    }
+
+
+@router.get("/api/group/tasks/{task_id}/health")
+def api_group_task_health(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_task = getattr(store, "get_group_task", None)
+    if not callable(fn_task):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    task = fn_task(task_id)
+    if not isinstance(task, dict):
+        raise _group_task_not_found(task_id)
+
+    fn_art = getattr(store, "get_group_artifacts", None)
+    fn_thread = getattr(store, "list_group_agent_messages", None)
+    fn_decisions = getattr(store, "list_group_decisions", None)
+    fn_rounds = getattr(store, "list_group_task_rounds", None)
+
+    artifacts = (fn_art(task_id) if callable(fn_art) else None) or {"changed_files": [], "test_result": None, "summary": ""}
+    quality_gate_ci = _group_quality_gate_ci(task_id, artifacts)
+
+    thread_n = len((fn_thread(task_id, limit=1, cursor=None, order="asc", role=None) if callable(fn_thread) else []) or [])
+    decisions_n = len((fn_decisions(task_id, limit=1, cursor=None, order="asc") if callable(fn_decisions) else []) or [])
+    rounds_n = len((fn_rounds(task_id, limit=1, cursor=None, order="asc") if callable(fn_rounds) else []) or [])
+
+    phase = str(task.get("phase") or "")
+    status = str(task.get("status") or "")
+    closed = _is_group_task_closed(task)
+    approve_ready = bool((phase == GROUP_PHASE_DECISION) and (not closed) and (not bool(quality_gate_ci.get("blocked"))))
+
+    blockers: list[str] = []
+    if closed:
+        blockers.append("GROUP_TASK_CLOSED")
+    if bool(quality_gate_ci.get("blocked")):
+        blockers.append(GROUP_ERROR_QUALITY_GATE_BLOCKED)
+    if thread_n == 0:
+        blockers.append("GROUP_EXPORT_THREAD_EMPTY")
+    if decisions_n == 0:
+        blockers.append("GROUP_EXPORT_DECISIONS_EMPTY")
+    if rounds_n == 0:
+        blockers.append("GROUP_EXPORT_ROUNDS_EMPTY")
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "phase": phase,
+        "status": status,
+        "closed": closed,
+        "approve_ready": approve_ready,
+        "quality_gate_ci": quality_gate_ci,
+        "signals": {"has_thread": thread_n > 0, "has_decisions": decisions_n > 0, "has_rounds": rounds_n > 0},
+        "blockers": blockers,
+    }
+
+
+@router.get("/api/group/tasks/{task_id}/prechecks")
+def api_group_task_prechecks(request: Request, task_id: str, actor_role: str = "owner", owner_id: str = "owner", next_phase: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_prechecks(
+        task_id=task_id,
+        actor_role=actor_role,
+        owner_id=owner_id,
+        next_phase=next_phase,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        is_closed=_is_group_task_closed,
+        normalize_role=_normalize_group_actor_role,
+        normalize_phase=_normalize_group_phase,
+        assert_can_approve=_assert_group_role_can_approve,
+        assert_owner=_assert_group_owner_identity,
+        assert_can_rerun=_assert_group_role_can_rerun,
+        assert_transition=_assert_group_phase_transition,
+        assert_can_submit_execution=_assert_group_role_can_submit_execution,
+        assert_can_qa_review=_assert_group_role_can_qa_review,
+        assert_can_post_thread=_assert_group_role_can_post_thread,
+        assert_can_upsert_artifacts=_assert_group_role_can_upsert_artifacts,
+        assert_can_cancel=_assert_group_role_can_cancel,
+        get_artifacts=get_group_artifacts_or_default,
+        quality_gate_ci=_group_quality_gate_ci,
+        phase_decision=GROUP_PHASE_DECISION,
+        phase_execution=GROUP_PHASE_EXECUTION,
+        phase_qa_verifying=GROUP_PHASE_QA_VERIFYING,
+        phase_planning=GROUP_PHASE_PLANNING,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+        err_approve_phase_invalid=GROUP_ERROR_APPROVE_PHASE_INVALID,
+        err_qa_phase_invalid=GROUP_ERROR_QA_PHASE_INVALID,
+        err_quality_gate_blocked=GROUP_ERROR_QUALITY_GATE_BLOCKED,
+        err_exec_phase_invalid="GROUP_EXECUTION_PHASE_INVALID",
+    )
+
+
+@router.get("/api/group/tasks/prechecks:batch")
+def api_group_tasks_prechecks_batch(request: Request, task_ids: str, actor_role: str = "owner", owner_id: str = "owner", next_phase: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    return handle_group_tasks_prechecks_batch(
+        task_ids=task_ids,
+        actor_role=actor_role,
+        owner_id=owner_id,
+        next_phase=next_phase,
+        fetch_prechecks=lambda tid, r, oid, p: api_group_task_prechecks(request, tid, actor_role=r, owner_id=oid, next_phase=p),
+    )
+
+
+@router.get("/api/group/tasks/{task_id}/can")
+def api_group_task_can(request: Request, task_id: str, actor_role: str = "owner", owner_id: str = "owner", next_phase: str | None = None) -> dict:
+    return handle_group_task_can(
+        task_id=task_id,
+        actor_role=actor_role,
+        owner_id=owner_id,
+        next_phase=next_phase,
+        fetch_prechecks=lambda tid, r, oid, p: api_group_task_prechecks(request, tid, actor_role=r, owner_id=oid, next_phase=p),
+    )
+
+
+@router.get("/api/group/tasks/can:batch")
+def api_group_tasks_can_batch(request: Request, task_ids: str, actor_role: str = "owner", owner_id: str = "owner", next_phase: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    return handle_group_tasks_can_batch(
+        task_ids=task_ids,
+        actor_role=actor_role,
+        owner_id=owner_id,
+        next_phase=next_phase,
+        fetch_can=lambda tid, r, oid, p: api_group_task_can(request, tid, actor_role=r, owner_id=oid, next_phase=p),
+    )
+
+
+@router.get("/api/group/tasks/{task_id}/quality-gate")
+def api_group_task_quality_gate(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_task = getattr(store, "get_group_task", None)
+    if not callable(fn_task):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    task = fn_task(task_id)
+    if not isinstance(task, dict):
+        raise _group_task_not_found(task_id)
+
+    artifacts = get_group_artifacts_or_default(store, task_id)
+    quality_gate_ci = _group_quality_gate_ci(task_id, artifacts)
+
+    approve_ready = bool(
+        (str(task.get("phase") or "") == GROUP_PHASE_DECISION)
+        and (not _is_group_task_closed(task))
+        and (not bool(quality_gate_ci.get("blocked")))
+    )
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "phase": str(task.get("phase") or ""),
+        "status": str(task.get("status") or ""),
+        "approve_ready": approve_ready,
+        "quality_gate_ci": quality_gate_ci,
+    }
+
+
+@router.get("/api/group/tasks/{task_id}/kpi")
+def api_group_task_kpi(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_kpi(
+        task_id=task_id,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        get_artifacts=get_group_artifacts_or_default,
+        quality_gate_ci=_group_quality_gate_ci,
+        is_task_closed=_is_group_task_closed,
+    )
+
+
+@router.post("/api/group/tasks/kpi:batch")
+def api_group_tasks_kpi_batch(request: Request, body: GroupTasksBatchKpiIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    return handle_group_tasks_kpi_batch(list(body.task_ids or []), body.owner_id, lambda tid: api_group_task_kpi(request, tid))
+
+
+@router.get("/api/group/tasks/kpi:batch")
+def api_group_tasks_kpi_batch_get(request: Request, task_ids: str, owner_id: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    return handle_group_tasks_kpi_batch_get(task_ids, owner_id, lambda tid: api_group_task_kpi(request, tid))
+
+
+@router.get("/api/group/tasks/kpi:leaderboard")
+def api_group_tasks_kpi_leaderboard(request: Request, top: int = 20, sort_by: str = "changed_files_count", owner_id: str | None = None, status: str | None = None, phase: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_tasks_kpi_leaderboard(
+        top=top,
+        sort_by=sort_by,
+        owner_id=owner_id,
+        status=status,
+        phase=phase,
+        list_tasks=lambda **kw: list_group_tasks_or_raise(store, **kw),
+        fetch_kpi=lambda tid: api_group_task_kpi(request, tid),
+    )
+
+
+@router.get("/api/group/tasks/kpi:distribution")
+def api_group_tasks_kpi_distribution(request: Request, owner_id: str | None = None, status: str | None = None, phase: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_tasks_kpi_distribution(
+        owner_id=owner_id,
+        status=status,
+        phase=phase,
+        list_tasks=lambda **kw: list_group_tasks_or_raise(store, **kw),
+        fetch_kpi=lambda tid: api_group_task_kpi(request, tid),
+    )
+
+
+@router.get("/api/group/tasks/kpi:alerts")
+def api_group_tasks_kpi_alerts(request: Request, limit: int = 50, owner_id: str | None = None, status: str | None = None, phase: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_tasks_kpi_alerts(
+        limit=limit,
+        owner_id=owner_id,
+        status=status,
+        phase=phase,
+        list_tasks=lambda **kw: list_group_tasks_or_raise(store, **kw),
+        fetch_kpi=lambda tid: api_group_task_kpi(request, tid),
+    )
+
+
+@router.get("/api/group/tasks/kpi:overview")
+def api_group_tasks_kpi_overview(request: Request, owner_id: str | None = None, status: str | None = None, phase: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_tasks_kpi_overview(
+        owner_id=owner_id,
+        status=status,
+        phase=phase,
+        list_tasks=lambda **kw: list_group_tasks_or_raise(store, **kw),
+        fetch_kpi=lambda tid: api_group_task_kpi(request, tid),
+    )
+
+
+@router.get("/api/group/tasks/kpi:owners")
+def api_group_tasks_kpi_owners(request: Request, top: int = 20, min_tasks: int = 1, status: str | None = None, phase: str | None = None) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_tasks_kpi_owners(
+        top=top,
+        min_tasks=min_tasks,
+        status=status,
+        phase=phase,
+        list_tasks=lambda **kw: list_group_tasks_or_raise(store, **kw),
+        fetch_kpi=lambda tid: api_group_task_kpi(request, tid),
+    )
+
+
+@router.get("/api/group/tasks/{task_id}/summary")
+def api_group_task_summary(request: Request, task_id: str) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    task = get_group_task_or_raise(store, task_id, not_found=_group_task_not_found)
+    artifacts = get_group_artifacts_or_default(store, task_id)
+    fn_rounds = getattr(store, "list_group_task_rounds", None)
+    rounds = (fn_rounds(task_id, limit=20, cursor=None, order="desc") if callable(fn_rounds) else []) or []
+    fn_decisions = getattr(store, "list_group_decisions", None)
+    decisions = (fn_decisions(task_id, limit=20, cursor=None, order="desc") if callable(fn_decisions) else []) or []
+
+    quality_gate_ci = _group_quality_gate_ci(task_id, artifacts)
+    approve_ready = bool(
+        (str(task.get("phase") or "") == GROUP_PHASE_DECISION)
+        and (not _is_group_task_closed(task))
+        and (not bool(quality_gate_ci.get("blocked")))
+    )
+
+    return {
+        "ok": True,
+        "task": _group_task_public(task),
+        "kpi": {
+            "changed_files_count": len(list(artifacts.get("changed_files") or [])),
+            "rounds_count": len(rounds),
+            "decisions_count": len(decisions),
+            "approve_ready": approve_ready,
+            "quality_gate_pass": bool(quality_gate_ci.get("pass")),
+        },
+        "latest": {
+            "round": (rounds[0] if rounds else None),
+            "decision": (decisions[0] if decisions else None),
+            "test_result": artifacts.get("test_result"),
+        },
+    }
+
+
+@router.post("/api/group/tasks/{task_id}/approve:precheck")
+def api_group_task_approve_precheck(request: Request, task_id: str, body: GroupTaskApproveIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_approve_precheck(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_approve=_assert_group_role_can_approve,
+        assert_owner=_assert_group_owner_identity,
+        is_closed=_is_group_task_closed,
+        get_artifacts=get_group_artifacts_or_default,
+        quality_gate_ci=_group_quality_gate_ci,
+        phase_decision=GROUP_PHASE_DECISION,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+        err_approve_phase_invalid=GROUP_ERROR_APPROVE_PHASE_INVALID,
+        err_quality_gate_blocked=GROUP_ERROR_QUALITY_GATE_BLOCKED,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/approve")
+def api_group_task_approve(request: Request, task_id: str, body: GroupTaskApproveIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_put = getattr(store, "insert_group_task", None)
+    if not callable(fn_put):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    return handle_group_task_approve(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        get_artifacts=get_group_artifacts_or_default,
+        is_closed=_is_group_task_closed,
+        normalize_role=_normalize_group_actor_role,
+        assert_can_approve=_assert_group_role_can_approve,
+        assert_owner=_assert_group_owner_identity,
+        quality_gate_ci=_group_quality_gate_ci,
+        phase_decision=GROUP_PHASE_DECISION,
+        status_done=GROUP_STATUS_DONE,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+        err_approve_phase_invalid=GROUP_ERROR_APPROVE_PHASE_INVALID,
+        err_quality_gate_blocked=GROUP_ERROR_QUALITY_GATE_BLOCKED,
+        public_task=_group_task_public,
+        now_ms=_now_ms,
+        put_task=lambda _, t: fn_put(t),
+        write_round=_write_group_round,
+        decision_type_approve=GROUP_DECISION_TYPE_APPROVE,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/rerun:precheck")
+def api_group_task_rerun_precheck(request: Request, task_id: str, body: GroupTaskRerunIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_rerun_precheck(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_phase=_normalize_group_phase,
+        normalize_role=_normalize_group_actor_role,
+        assert_can_rerun=_assert_group_role_can_rerun,
+        assert_transition=_assert_group_phase_transition,
+        is_closed=_is_group_task_closed,
+        phase_planning=GROUP_PHASE_PLANNING,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/rerun")
+def api_group_task_rerun(request: Request, task_id: str, body: GroupTaskRerunIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_put = getattr(store, "insert_group_task", None)
+    if not callable(fn_put):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    return handle_group_task_rerun(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        is_closed=_is_group_task_closed,
+        normalize_phase=_normalize_group_phase,
+        normalize_role=_normalize_group_actor_role,
+        assert_can_rerun=_assert_group_role_can_rerun,
+        assert_transition=_assert_group_phase_transition,
+        phase_planning=GROUP_PHASE_PLANNING,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+        err_transition_not_allowed=GROUP_ERROR_TRANSITION_NOT_ALLOWED,
+        err_phase_not_allowed=GROUP_ERROR_PHASE_NOT_ALLOWED,
+        status_from_phase=_group_status_from_phase,
+        public_task=_group_task_public,
+        now_ms=_now_ms,
+        put_task=lambda _, t: fn_put(t),
+        write_round=_write_group_round,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/execution-submit:precheck")
+def api_group_task_execution_submit_precheck(request: Request, task_id: str, body: GroupTaskExecutionSubmitIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_execution_submit_precheck(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_submit_execution=_assert_group_role_can_submit_execution,
+        is_closed=_is_group_task_closed,
+        phase_execution=GROUP_PHASE_EXECUTION,
+        err_execution_phase_invalid="GROUP_EXECUTION_PHASE_INVALID",
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/execution-submit")
+def api_group_task_execution_submit(request: Request, task_id: str, body: GroupTaskExecutionSubmitIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_put = getattr(store, "insert_group_task", None)
+    if not callable(fn_put):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    return handle_group_task_execution_submit(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        is_closed=_is_group_task_closed,
+        normalize_role=_normalize_group_actor_role,
+        assert_can_submit_execution=_assert_group_role_can_submit_execution,
+        phase_execution=GROUP_PHASE_EXECUTION,
+        phase_qa_verifying=GROUP_PHASE_QA_VERIFYING,
+        status_running=GROUP_STATUS_RUNNING,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+        err_exec_phase_invalid=GROUP_ERROR_EXEC_PHASE_INVALID,
+        public_task=_group_task_public,
+        now_ms=_now_ms,
+        put_task=lambda _, t: fn_put(t),
+        write_round=_write_group_round,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/qa-review:precheck")
+def api_group_task_qa_review_precheck(request: Request, task_id: str, body: GroupTaskQaReviewIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_qa_review_precheck(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_qa_review=_assert_group_role_can_qa_review,
+        is_closed=_is_group_task_closed,
+        phase_qa_verifying=GROUP_PHASE_QA_VERIFYING,
+        err_qa_phase_invalid=GROUP_ERROR_QA_PHASE_INVALID,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/qa-review")
+def api_group_task_qa_review(request: Request, task_id: str, body: GroupTaskQaReviewIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_put = getattr(store, "insert_group_task", None)
+    if not callable(fn_put):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    return handle_group_task_qa_review(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_qa_review=_assert_group_role_can_qa_review,
+        phase_qa_verifying=GROUP_PHASE_QA_VERIFYING,
+        phase_decision=GROUP_PHASE_DECISION,
+        phase_execution=GROUP_PHASE_EXECUTION,
+        status_from_phase=_group_status_from_phase,
+        public_task=_group_task_public,
+        now_ms=_now_ms,
+        put_task=lambda _, t: fn_put(t),
+        write_round=_write_group_round,
+        err_qa_phase_invalid=GROUP_ERROR_QA_PHASE_INVALID,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/cancel:precheck")
+def api_group_task_cancel_precheck(request: Request, task_id: str, body: GroupTaskCancelIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    return handle_group_task_cancel_precheck(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_cancel=_assert_group_role_can_cancel,
+        assert_owner=_assert_group_owner_identity,
+        is_closed=_is_group_task_closed,
+        err_task_closed=GROUP_ERROR_TASK_CLOSED,
+    )
+
+
+@router.post("/api/group/tasks/{task_id}/cancel")
+def api_group_task_cancel(request: Request, task_id: str, body: GroupTaskCancelIn) -> dict:
+    _ensure_group_mode_enabled(_get_settings(request))
+    store = _get_store(request)
+    fn_put = getattr(store, "insert_group_task", None)
+    if not callable(fn_put):
+        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+    return handle_group_task_cancel(
+        task_id=task_id,
+        body=body,
+        store=store,
+        get_task_or_raise=lambda s, tid: get_group_task_or_raise(s, tid, not_found=_group_task_not_found),
+        normalize_role=_normalize_group_actor_role,
+        assert_can_cancel=_assert_group_role_can_cancel,
+        assert_owner=_assert_group_owner_identity,
+        status_done=GROUP_STATUS_DONE,
+        status_cancelled="cancelled",
+        public_task=_group_task_public,
+        now_ms=_now_ms,
+        put_task=lambda _, t: fn_put(t),
+        write_round=_write_group_round,
+        decision_type_cancel=GROUP_DECISION_TYPE_CANCEL,
+    )
+
+
+@router.get("/api/agent/tasks/{task_id}/steps")
+def api_agent_task_steps(request: Request, task_id: str, limit: int = 500, offset: int = 0, cursor: int | None = None, attempt: int | None = None, step_type: str | None = None, ok: bool | None = None, order: str = "asc", from_ts: int | None = None, to_ts: int | None = None, fields: str | None = None, format: str | None = None, include_summary: bool = True) -> dict:
+    store = _get_store(request)
+    settings = _get_settings(request)
+    fn = getattr(store, "list_agent_task_steps", None)
+    p95_threshold_ms = max(1, int(getattr(settings, "health_p95_threshold_ms", 1000)))
+    penalty_per_100ms = max(1, int(getattr(settings, "health_penalty_per_100ms", 1)))
+    penalty_cap = max(0, int(getattr(settings, "health_penalty_cap", 40)))
+    green_min_score = max(0, min(100, int(getattr(settings, "health_green_min_score", 90))))
+    yellow_min_score = max(0, min(100, int(getattr(settings, "health_yellow_min_score", 70))))
+    yellow_max_failure_rate = max(0.0, float(getattr(settings, "health_yellow_max_failure_rate", 20.0)))
+    empty_score = max(0, min(100, int(getattr(settings, "health_empty_score", 50))))
+    health_config = {
+        "p95_threshold_ms": p95_threshold_ms,
+        "penalty_per_100ms": penalty_per_100ms,
+        "penalty_cap": penalty_cap,
+        "green_min_score": green_min_score,
+        "yellow_min_score": yellow_min_score,
+        "yellow_max_failure_rate": yellow_max_failure_rate,
+        "empty_score": empty_score,
+    }
+    config_version = hashlib.sha1(json.dumps(health_config, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    summary_window_ms = (None if from_ts is None or to_ts is None else abs(max(0, int(to_ts)) - max(0, int(from_ts))))
+    summary_id_salt = str(getattr(settings, "summary_id_salt", "") or "")
+    summary_id_salted = bool(summary_id_salt)
+    summary_salt_hint = ("configured" if summary_id_salted else "not_configured")
+    allowed_fields = {"step_no", "step_type", "attempt", "input_json", "output_json", "ok", "latency_ms", "created_at_ms"}
+    format_v = (str(format or "full").strip().lower() or "full")
+    if format_v not in {"full", "compact"}:
+        format_v = "full"
+    if format_v == "compact":
+        selected_fields = ["step_no", "step_type", "attempt", "ok", "latency_ms", "created_at_ms"]
+    else:
+        selected_fields = [f.strip() for f in str(fields or "").split(",") if f.strip() in allowed_fields]
+
+    attempt_fallback = (None if attempt is None else max(0, int(attempt)))
+    step_type_fallback = (None if step_type is None else str(step_type).strip().upper())
+    if step_type_fallback == "":
+        step_type_fallback = None
+    ok_fallback = (None if ok is None else bool(ok))
+    order_fallback = ("desc" if str(order).strip().lower() == "desc" else "asc")
+    from_ts_fallback = (None if from_ts is None else max(0, int(from_ts)))
+    to_ts_fallback = (None if to_ts is None else max(0, int(to_ts)))
+    paging_mode_fallback = ("cursor" if cursor is not None else "offset")
+    offset_fallback = (0 if cursor is not None else max(0, int(offset)))
+    cursor_fallback = (None if cursor is None else max(0, int(cursor)))
+    limit_fallback = max(1, min(int(limit), 5000))
+    summary_generated_at_ms_fallback = _now_ms()
+    fallback_extra = {
+        "order": order_fallback,
+        "paging_mode": paging_mode_fallback,
+        "offset": offset_fallback,
+        "cursor": cursor_fallback,
+        "limit": limit_fallback,
+    }
+    summary_fingerprint_fallback = _summary_key(
+        "sfp_",
+        _summary_payload(
+            task_id=task_id,
+            attempt=attempt_fallback,
+            step_type=step_type_fallback,
+            step_ok=ok_fallback,
+            from_ts=from_ts_fallback,
+            to_ts=to_ts_fallback,
+            window_ms=summary_window_ms,
+            config_version=config_version,
+            salt=summary_id_salt,
+            extra=fallback_extra,
+        ),
+    )
+    summary_id_fallback = _summary_key(
+        "sum_",
+        _summary_payload(
+            task_id=task_id,
+            attempt=attempt_fallback,
+            step_type=step_type_fallback,
+            step_ok=ok_fallback,
+            from_ts=from_ts_fallback,
+            to_ts=to_ts_fallback,
+            window_ms=summary_window_ms,
+            config_version=config_version,
+            salt=summary_id_salt,
+            generated_at_ms=summary_generated_at_ms_fallback,
+            extra=fallback_extra,
+        ),
+    )
+
+    if callable(fn):
+        attempt_v = (None if attempt is None else max(0, int(attempt)))
+        step_type_v = (None if step_type is None else str(step_type).strip().upper())
+        if step_type_v == "":
+            step_type_v = None
+        ok_v = (None if ok is None else bool(ok))
+        limit_v = max(1, min(int(limit), 5000))
+        offset_v = max(0, int(offset))
+        cursor_v = (None if cursor is None else max(0, int(cursor)))
+        paging_mode = ("cursor" if cursor_v is not None else "offset")
+        effective_offset = (0 if cursor_v is not None else offset_v)
+        order_v = ("desc" if str(order).strip().lower() == "desc" else "asc")
+        from_ts_v = (None if from_ts is None else max(0, int(from_ts)))
+        to_ts_v = (None if to_ts is None else max(0, int(to_ts)))
+        if from_ts_v is not None and to_ts_v is not None and from_ts_v > to_ts_v:
+            from_ts_v, to_ts_v = to_ts_v, from_ts_v
+        summary_id = "sum_" + hashlib.sha1(
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "attempt": attempt_v,
+                    "step_type": step_type_v,
+                    "step_ok": ok_v,
+                    "order": order_v,
+                    "from_ts": from_ts_v,
+                    "to_ts": to_ts_v,
+                    "window_ms": summary_window_ms,
+                    "paging_mode": paging_mode,
+                    "offset": effective_offset,
+                    "cursor": cursor_v,
+                    "limit": limit_v,
+                    "config_version": config_version,
+                    "summary_generated_at_ms": summary_generated_at_ms_fallback,
+                    "salt": summary_id_salt,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        rows = fn(task_id, limit=limit_v + 1, offset=effective_offset, cursor=cursor_v, attempt=attempt_v, step_type=step_type_v, ok=ok_v, order=order_v, from_ts=from_ts_v, to_ts=to_ts_v)
+        has_more = len(rows) > limit_v
+        items_raw = rows[:limit_v]
+        next_offset = ((effective_offset + limit_v) if (has_more and paging_mode == "offset") else None)
+        next_cursor = (int(items_raw[-1].get("_cursor")) if has_more and items_raw else None)
+        items = []
+        for it in items_raw:
+            row = dict(it)
+            row.pop("_cursor", None)
+            items.append(row)
+
+        summary: dict[str, Any] | None = None
+        if bool(include_summary):
+            page_count = len(items)
+            success_count = sum(1 for it in items if bool(it.get("ok")))
+            failed_count = page_count - success_count
+            latency_sum = sum(int(it.get("latency_ms") or 0) for it in items)
+            avg_latency_ms = (int(latency_sum / page_count) if page_count > 0 else 0)
+            p95_latency_ms = 0
+            min_latency_ms = 0
+            max_latency_ms = 0
+            if page_count > 0:
+                lats = sorted(int(it.get("latency_ms") or 0) for it in items)
+                p95_latency_ms = lats[int((page_count - 1) * 0.95)]
+                min_latency_ms = lats[0]
+                max_latency_ms = lats[-1]
+            sr = (round((success_count * 100.0) / page_count, 2) if page_count > 0 else 0.0)
+            fr = (round((failed_count * 100.0) / page_count, 2) if page_count > 0 else 0.0)
+            over_threshold_ms = max(0, p95_latency_ms - p95_threshold_ms)
+            raw_penalty = max(0, (over_threshold_ms // 100) * penalty_per_100ms)
+            latency_penalty = (min(penalty_cap, raw_penalty) if p95_latency_ms > p95_threshold_ms else 0)
+            base_score = (empty_score if page_count <= 0 else max(0, min(100, int(round(sr)))))
+            health_score = (empty_score if page_count <= 0 else max(0, min(100, base_score - latency_penalty)))
+            if page_count <= 0:
+                health_level = "yellow"
+            elif failed_count <= 0 and health_score >= green_min_score:
+                health_level = "green"
+            elif health_score >= yellow_min_score or fr <= yellow_max_failure_rate:
+                health_level = "yellow"
+            else:
+                health_level = "red"
+            by_type: dict[str, int] = {}
+            for it in items:
+                k = str(it.get("step_type") or "UNKNOWN")
+                by_type[k] = by_type.get(k, 0) + 1
+            summary_generated_at_ms_actual = _now_ms()
+            runtime_extra = {
+                "order": order_v,
+                "paging_mode": paging_mode,
+                "offset": effective_offset,
+                "cursor": cursor_v,
+                "limit": limit_v,
+            }
+            summary_fingerprint = _summary_key(
+                "sfp_",
+                _summary_payload(
+                    task_id=task_id,
+                    attempt=attempt_v,
+                    step_type=step_type_v,
+                    step_ok=ok_v,
+                    from_ts=from_ts_v,
+                    to_ts=to_ts_v,
+                    window_ms=summary_window_ms,
+                    config_version=config_version,
+                    salt=summary_id_salt,
+                    extra=runtime_extra,
+                ),
+            )
+            summary_id = _summary_key(
+                "sum_",
+                _summary_payload(
+                    task_id=task_id,
+                    attempt=attempt_v,
+                    step_type=step_type_v,
+                    step_ok=ok_v,
+                    from_ts=from_ts_v,
+                    to_ts=to_ts_v,
+                    window_ms=summary_window_ms,
+                    config_version=config_version,
+                    salt=summary_id_salt,
+                    generated_at_ms=summary_generated_at_ms_actual,
+                    extra=runtime_extra,
+                ),
+            )
+            summary = {
+                "page_count": page_count,
+                "success_count": success_count,
+                "failed_count": failed_count,
+                "success_rate": sr,
+                "failure_rate": fr,
+                "health_level": health_level,
+                "health_score": health_score,
+                "health_config": health_config,
+                "config_version": config_version,
+                "summary_signature_algo": _SUMMARY_SIGNATURE_ALGO,
+                "summary_generated_at_ms": summary_generated_at_ms_actual,
+                "summary_window_ms": summary_window_ms,
+                "summary_id": summary_id,
+                "summary_fingerprint": summary_fingerprint,
+                "summary_fingerprint_algo": _SUMMARY_FINGERPRINT_ALGO,
+                "summary_id_salted": summary_id_salted,
+                "summary_salt_hint": summary_salt_hint,
+                "avg_latency_ms": avg_latency_ms,
+                "min_latency_ms": min_latency_ms,
+                "max_latency_ms": max_latency_ms,
+                "p95_latency_ms": p95_latency_ms,
+                "latency_penalty_preview": {
+                    "p95_latency_ms": p95_latency_ms,
+                    "threshold_ms": p95_threshold_ms,
+                    "over_threshold_ms": over_threshold_ms,
+                    "raw_penalty": raw_penalty,
+                    "capped_penalty": latency_penalty,
+                    "penalty_cap": penalty_cap,
+                    "base_score": base_score,
+                    "final_score": health_score,
+                    "applies_penalty": bool(latency_penalty > 0),
+                    "reason": ("p95 exceeds threshold" if latency_penalty > 0 else "p95 within threshold"),
+                },
+                "by_step_type": by_type,
+            }
+
+        if selected_fields:
+            items = [{k: v for k, v in it.items() if k in set(selected_fields)} for it in items]
+
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "attempt": attempt_v,
+            "step_type": step_type_v,
+            "step_ok": ok_v,
+            "order": order_v,
+            "from_ts": from_ts_v,
+            "to_ts": to_ts_v,
+            "format": format_v,
+            "fields": (selected_fields or None),
+            "include_summary": bool(include_summary),
+            "paging_mode": paging_mode,
+            "deprecated_offset": bool(cursor_v is None and offset_v > 0),
+            "offset": effective_offset,
+            "cursor": cursor_v,
+            "limit": limit_v,
+            "next_offset": next_offset,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "summary": summary,
+            "items": items,
+        }
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "attempt": attempt,
+        "step_type": step_type,
+        "step_ok": ok,
+        "order": ("desc" if str(order).strip().lower() == "desc" else "asc"),
+        "from_ts": (None if from_ts is None else max(0, int(from_ts))),
+        "to_ts": (None if to_ts is None else max(0, int(to_ts))),
+        "fields": (selected_fields or None),
+        "include_summary": bool(include_summary),
+        "paging_mode": ("cursor" if cursor is not None else "offset"),
+        "deprecated_offset": bool(cursor is None and max(0, int(offset)) > 0),
+        "offset": (0 if cursor is not None else max(0, int(offset))),
+        "cursor": (None if cursor is None else max(0, int(cursor))),
+        "limit": max(1, min(int(limit), 5000)),
+        "next_offset": None,
+        "next_cursor": None,
+        "has_more": False,
+        "summary": ({"page_count": 0, "success_count": 0, "failed_count": 0, "success_rate": 0.0, "failure_rate": 0.0, "health_level": "yellow", "health_score": empty_score, "health_config": health_config, "config_version": config_version, "summary_signature_algo": _SUMMARY_SIGNATURE_ALGO, "summary_generated_at_ms": summary_generated_at_ms_fallback, "summary_window_ms": summary_window_ms, "summary_id": summary_id_fallback, "summary_fingerprint": summary_fingerprint_fallback, "summary_fingerprint_algo": "sha1-16-stable", "summary_id_salted": summary_id_salted, "summary_salt_hint": summary_salt_hint, "avg_latency_ms": 0, "min_latency_ms": 0, "max_latency_ms": 0, "p95_latency_ms": 0, "latency_penalty_preview": {"p95_latency_ms": 0, "threshold_ms": p95_threshold_ms, "over_threshold_ms": 0, "raw_penalty": 0, "capped_penalty": 0, "penalty_cap": penalty_cap, "base_score": empty_score, "final_score": empty_score, "applies_penalty": False, "reason": "p95 within threshold"}, "by_step_type": {}} if bool(include_summary) else None),
+        "items": [],
+    }
+
+
+@router.get("/api/agent/tasks/{task_id}/steps/summary")
+def api_agent_task_steps_summary(
+    request: Request,
+    task_id: str,
+    attempt: int | None = None,
+    step_type: str | None = None,
+    ok: bool | None = None,
+    from_ts: int | None = None,
+    to_ts: int | None = None,
+    error_top_n: int = 5,
+    success_top_n: int = 5,
+) -> dict:
+    store = _get_store(request)
+    settings = _get_settings(request)
+    p95_threshold_ms = max(1, int(getattr(settings, "health_p95_threshold_ms", 1000)))
+    penalty_per_100ms = max(1, int(getattr(settings, "health_penalty_per_100ms", 1)))
+    penalty_cap = max(0, int(getattr(settings, "health_penalty_cap", 40)))
+    green_min_score = max(0, min(100, int(getattr(settings, "health_green_min_score", 90))))
+    yellow_min_score = max(0, min(100, int(getattr(settings, "health_yellow_min_score", 70))))
+    yellow_max_failure_rate = max(0.0, float(getattr(settings, "health_yellow_max_failure_rate", 20.0)))
+    empty_score = max(0, min(100, int(getattr(settings, "health_empty_score", 50))) )
+    health_config = {
+        "p95_threshold_ms": p95_threshold_ms,
+        "penalty_per_100ms": penalty_per_100ms,
+        "penalty_cap": penalty_cap,
+        "green_min_score": green_min_score,
+        "yellow_min_score": yellow_min_score,
+        "yellow_max_failure_rate": yellow_max_failure_rate,
+        "empty_score": empty_score,
+    }
+    config_version = hashlib.sha1(json.dumps(health_config, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    summary_id_salt = str(getattr(settings, "summary_id_salt", "") or "")
+    summary_id_salted = bool(summary_id_salt)
+    summary_salt_hint = ("configured" if summary_id_salted else "not_configured")
+    summary_generated_at_ms = _now_ms()
+    window_ms_raw = None
+    if from_ts is not None and to_ts is not None:
+        f0 = max(0, int(from_ts))
+        t0 = max(0, int(to_ts))
+        window_ms_raw = abs(t0 - f0)
+    fn = getattr(store, "list_agent_task_steps", None)
+    fn_agg = getattr(store, "aggregate_agent_task_steps", None)
+    if not callable(fn) and not callable(fn_agg):
+        summary_fingerprint = _summary_key(
+            "sfp_",
+            _summary_payload(
+                task_id=task_id,
+                attempt=attempt,
+                step_type=step_type,
+                step_ok=ok,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                window_ms=window_ms_raw,
+                config_version=config_version,
+                salt=summary_id_salt,
+            ),
+        )
+        summary_id = _summary_key(
+            "sum_",
+            _summary_payload(
+                task_id=task_id,
+                attempt=attempt,
+                step_type=step_type,
+                step_ok=ok,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                window_ms=window_ms_raw,
+                config_version=config_version,
+                salt=summary_id_salt,
+                generated_at_ms=summary_generated_at_ms,
+            ),
+        )
+        health_config_resp = {
+            **health_config,
+            "latency_penalty_preview": {
+                "p95_latency_ms": 0,
+                "threshold_ms": p95_threshold_ms,
+                "over_threshold_ms": 0,
+                "raw_penalty": 0,
+                "capped_penalty": 0,
+                "penalty_cap": penalty_cap,
+                "base_score": 0,
+                "final_score": 50,
+                "applies_penalty": False,
+                "reason": "p95 within threshold",
+            },
+        }
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "attempt": attempt,
+            "step_type": step_type,
+            "step_ok": ok,
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "window_ms": window_ms_raw,
+            "health_config": health_config_resp,
+            "config_version": config_version,
+            "summary_generated_at_ms": summary_generated_at_ms,
+            "summary_signature_algo": _SUMMARY_SIGNATURE_ALGO,
+            "summary_id_salted": summary_id_salted,
+            "summary_salt_hint": summary_salt_hint,
+            "summary_id": summary_id,
+            "summary_fingerprint": summary_fingerprint,
+            "summary_fingerprint_algo": _SUMMARY_FINGERPRINT_ALGO,
+            "summary": {"total": 0, "success_count": 0, "failed_count": 0, "success_rate": 0.0, "failure_rate": 0.0, "health_level": "yellow", "health_score": 50, "avg_latency_ms": 0, "min_latency_ms": 0, "max_latency_ms": 0, "p95_latency_ms": 0, "by_step_type": {}, "error_top": [], "success_top": []},
+        }
+
+    attempt_v = (None if attempt is None else max(0, int(attempt)))
+    step_type_v = (None if step_type is None else str(step_type).strip().upper())
+    if step_type_v == "":
+        step_type_v = None
+    ok_v = (None if ok is None else bool(ok))
+    from_ts_v = (None if from_ts is None else max(0, int(from_ts)))
+    to_ts_v = (None if to_ts is None else max(0, int(to_ts)))
+    if from_ts_v is not None and to_ts_v is not None and from_ts_v > to_ts_v:
+        from_ts_v, to_ts_v = to_ts_v, from_ts_v
+    window_ms = (None if (from_ts_v is None or to_ts_v is None) else max(0, int(to_ts_v - from_ts_v)))
+
+    top_n_v = max(1, min(int(error_top_n), 20))
+    succ_top_n_v = max(1, min(int(success_top_n), 20))
+    summary_extra = {"error_top_n": top_n_v, "success_top_n": succ_top_n_v}
+    summary_fingerprint = _summary_key(
+        "sfp_",
+        _summary_payload(
+            task_id=task_id,
+            attempt=attempt_v,
+            step_type=step_type_v,
+            step_ok=ok_v,
+            from_ts=from_ts_v,
+            to_ts=to_ts_v,
+            window_ms=window_ms,
+            config_version=config_version,
+            salt=summary_id_salt,
+            extra=summary_extra,
+        ),
+    )
+    summary_id = _summary_key(
+        "sum_",
+        _summary_payload(
+            task_id=task_id,
+            attempt=attempt_v,
+            step_type=step_type_v,
+            step_ok=ok_v,
+            from_ts=from_ts_v,
+            to_ts=to_ts_v,
+            window_ms=window_ms,
+            config_version=config_version,
+            salt=summary_id_salt,
+            generated_at_ms=summary_generated_at_ms,
+            extra=summary_extra,
+        ),
+    )
+    if callable(fn_agg):
+        summary = fn_agg(
+            task_id,
+            attempt=attempt_v,
+            step_type=step_type_v,
+            ok=ok_v,
+            from_ts=from_ts_v,
+            to_ts=to_ts_v,
+            error_top_n=top_n_v,
+            success_top_n=succ_top_n_v,
+            p95_threshold_ms=p95_threshold_ms,
+            penalty_per_100ms=penalty_per_100ms,
+            penalty_cap=penalty_cap,
+            green_min_score=green_min_score,
+            yellow_min_score=yellow_min_score,
+            yellow_max_failure_rate=yellow_max_failure_rate,
+            empty_score=empty_score,
+        )
+    else:
+        rows = fn(task_id, limit=5000, offset=0, cursor=None, attempt=attempt_v, step_type=step_type_v, ok=ok_v, order="asc", from_ts=from_ts_v, to_ts=to_ts_v)
+        items: list[dict[str, Any]] = []
+        for it in rows:
+            row = dict(it)
+            row.pop("_cursor", None)
+            items.append(row)
+        total = len(items)
+        success_count = sum(1 for it in items if bool(it.get("ok")))
+        failed_count = total - success_count
+        latency_sum = sum(int(it.get("latency_ms") or 0) for it in items)
+        avg_latency_ms = (int(latency_sum / total) if total > 0 else 0)
+        by_type: dict[str, int] = {}
+        for it in items:
+            k = str(it.get("step_type") or "UNKNOWN")
+            by_type[k] = by_type.get(k, 0) + 1
+        p95_latency_ms = 0
+        if total > 0:
+            lats = sorted(int(it.get("latency_ms") or 0) for it in items)
+            p95_latency_ms = lats[int((total - 1) * 0.95)]
+        min_latency_ms = (min(int(it.get("latency_ms") or 0) for it in items) if total > 0 else 0)
+        max_latency_ms = (max(int(it.get("latency_ms") or 0) for it in items) if total > 0 else 0)
+        err_map: dict[str, int] = {}
+        succ_map: dict[str, int] = {}
+        for it in items:
+            k = str(it.get("step_type") or "UNKNOWN")
+            if bool(it.get("ok")):
+                succ_map[k] = succ_map.get(k, 0) + 1
+            else:
+                err_map[k] = err_map.get(k, 0) + 1
+        error_top = [{"step_type": k, "count": c} for k, c in sorted(err_map.items(), key=lambda x: (-x[1], x[0]))[:top_n_v]]
+        success_top = [{"step_type": k, "count": c} for k, c in sorted(succ_map.items(), key=lambda x: (-x[1], x[0]))[:succ_top_n_v]]
+        sr = (round((success_count * 100.0) / total, 2) if total > 0 else 0.0)
+        fr = (round((failed_count * 100.0) / total, 2) if total > 0 else 0.0)
+        latency_penalty = (min(penalty_cap, int((p95_latency_ms - p95_threshold_ms) / 100) * penalty_per_100ms) if p95_latency_ms > p95_threshold_ms else 0)
+        if total <= 0:
+            health_score = empty_score
+            health_level = "yellow"
+        else:
+            health_score = max(0, min(100, int(round(sr)) - latency_penalty))
+            if failed_count <= 0 and health_score >= green_min_score:
+                health_level = "green"
+            elif health_score >= yellow_min_score or fr <= yellow_max_failure_rate:
+                health_level = "yellow"
+            else:
+                health_level = "red"
+        summary = {
+            "total": total,
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "success_rate": sr,
+            "failure_rate": fr,
+            "health_level": health_level,
+            "health_score": health_score,
+            "avg_latency_ms": avg_latency_ms,
+            "min_latency_ms": min_latency_ms,
+            "max_latency_ms": max_latency_ms,
+            "p95_latency_ms": p95_latency_ms,
+            "by_step_type": by_type,
+            "error_top": error_top,
+            "success_top": success_top,
+        }
+
+    total_v = int(summary.get("total") or 0)
+    success_v = int(summary.get("success_count") or 0)
+    failed_v = int(summary.get("failed_count") or 0)
+    if "success_rate" not in summary:
+        summary["success_rate"] = (round((success_v * 100.0) / total_v, 2) if total_v > 0 else 0.0)
+    if "failure_rate" not in summary:
+        summary["failure_rate"] = (round((failed_v * 100.0) / total_v, 2) if total_v > 0 else 0.0)
+    p95_v = int(summary.get("p95_latency_ms") or 0)
+    latency_penalty_v = (min(penalty_cap, int((p95_v - p95_threshold_ms) / 100) * penalty_per_100ms) if p95_v > p95_threshold_ms else 0)
+    if "health_score" not in summary:
+        sr_v = float(summary.get("success_rate") or 0.0)
+        summary["health_score"] = (empty_score if total_v <= 0 else max(0, min(100, int(round(sr_v)) - latency_penalty_v)))
+    if "health_level" not in summary:
+        fr_v = float(summary.get("failure_rate") or 0.0)
+        hs_v = int(summary.get("health_score") or 0)
+        if total_v <= 0:
+            summary["health_level"] = "yellow"
+        elif failed_v <= 0 and hs_v >= green_min_score:
+            summary["health_level"] = "green"
+        elif hs_v >= yellow_min_score or fr_v <= yellow_max_failure_rate:
+            summary["health_level"] = "yellow"
+        else:
+            summary["health_level"] = "red"
+
+    over_threshold_ms = max(0, p95_v - p95_threshold_ms)
+    raw_penalty_v = max(0, (over_threshold_ms // 100) * penalty_per_100ms)
+    base_score_v = (empty_score if total_v <= 0 else max(0, min(100, int(round(float(summary.get("success_rate") or 0.0))))))
+    final_score_v = int(summary.get("health_score") or 0)
+    applies_penalty_v = bool(latency_penalty_v > 0)
+    penalty_reason_v = ("p95 exceeds threshold" if applies_penalty_v else "p95 within threshold")
+    health_config_resp = {
+        **health_config,
+        "latency_penalty_preview": {
+            "p95_latency_ms": p95_v,
+            "threshold_ms": p95_threshold_ms,
+            "over_threshold_ms": over_threshold_ms,
+            "raw_penalty": raw_penalty_v,
+            "capped_penalty": latency_penalty_v,
+            "penalty_cap": penalty_cap,
+            "base_score": base_score_v,
+            "final_score": final_score_v,
+            "applies_penalty": applies_penalty_v,
+            "reason": penalty_reason_v,
+        },
+    }
+
+    top_issue_summary = str(summary.get("top_issue_summary") or "") if isinstance(summary, dict) else ""
+    if not top_issue_summary:
+        if total_v <= 0:
+            top_issue_summary = "no step data"
+        elif failed_v <= 0:
+            sr = float(summary.get("success_rate") or 0.0)
+            top_issue_summary = f"healthy run: {sr:.2f}% success ({success_v}/{total_v})"
+        else:
+            err_top = summary.get("error_top") if isinstance(summary, dict) else None
+            first = (err_top[0] if isinstance(err_top, list) and err_top and isinstance(err_top[0], dict) else {})
+            st = str(first.get("step_type") or "UNKNOWN")
+            cnt = int(first.get("count") or failed_v)
+            fr = float(summary.get("failure_rate") or 0.0)
+            top_issue_summary = f"top failure: {st} x{cnt} (failure_rate={fr:.2f}%)"
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "attempt": attempt_v,
+        "step_type": step_type_v,
+        "step_ok": ok_v,
+        "from_ts": from_ts_v,
+        "to_ts": to_ts_v,
+        "window_ms": window_ms,
+        "error_top_n": top_n_v,
+        "success_top_n": succ_top_n_v,
+        "health_config": health_config_resp,
+        "config_version": config_version,
+        "summary_generated_at_ms": summary_generated_at_ms,
+        "summary_signature_algo": _SUMMARY_SIGNATURE_ALGO,
+        "summary_id_salted": summary_id_salted,
+        "summary_salt_hint": summary_salt_hint,
+        "summary_id": summary_id,
+        "summary_fingerprint": summary_fingerprint,
+        "summary_fingerprint_algo": _SUMMARY_FINGERPRINT_ALGO,
+        "top_issue_summary": top_issue_summary,
+        "summary": summary,
+    }
+
+
 @router.get("/api/agent/tasks/{task_id}/artifacts")
 def api_agent_task_artifacts(request: Request, task_id: str) -> dict:
     store = _get_store(request)
@@ -2002,7 +4717,9 @@ def api_agent_task_artifacts(request: Request, task_id: str) -> dict:
         art = fn(task_id)
         if art is not None:
             t = fn_task(task_id) if callable(fn_task) else None
-            return {"ok": True, "task_id": task_id, "artifacts": art, "last_verify": (t.get("last_verify") if isinstance(t, dict) else None)}
+            fn_steps = getattr(store, "list_agent_task_steps", None)
+            steps = (fn_steps(task_id, limit=500, offset=0, cursor=None, attempt=None, order="asc", from_ts=None, to_ts=None) if callable(fn_steps) else [])
+            return {"ok": True, "task_id": task_id, "artifacts": art or {"changed_files": [], "step_results": [], "test_result": None, "summary": ""}, "last_verify": (t.get("last_verify") if isinstance(t, dict) else None), "steps": steps}
     with _AGENT_TASKS_LOCK:
         task = _AGENT_TASKS.get(task_id)
         if not isinstance(task, dict):
@@ -2010,8 +4727,9 @@ def api_agent_task_artifacts(request: Request, task_id: str) -> dict:
         return {
             "ok": True,
             "task_id": task_id,
-            "artifacts": task.get("artifacts") or {"changed_files": [], "test_result": None, "summary": ""},
+            "artifacts": task.get("artifacts") or {"changed_files": [], "step_results": [], "test_result": None, "summary": ""},
             "last_verify": task.get("last_verify"),
+            "steps": [],
         }
 
 
