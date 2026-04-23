@@ -317,3 +317,77 @@
 ### 23.4 结论
 - 结论：V2 后端重构拆分阶段通过验收，满足“行为等价 + 可维护性提升”目标。
 - 当前状态：可进入发布收口（commit/tag）与后续产品化外围阶段。
+
+## 24. 阶段3（3天）执行计划
+
+### 24.1 Day 1 监控指标落地
+- 目标：先完成“可观测最小闭环”，用已有接口产出运营关键指标。
+- 实施范围（后端接口增强，先 JSON 输出）：
+  - `group_task_done_rate`（任务完成率）
+  - `group_quality_gate_block_rate`（门禁阻断率）
+  - `group_audit_closure_ready_rate`（审计闭环就绪率）
+  - `group_task_avg_cycle_ms`（平均任务周期）
+- 落地结果：
+  - `GET /api/group/tasks/kpi:overview` 已输出以上 4 项指标及样本字段。
+  - `GET /api/group/tasks/metrics` 已追加 `metrics.kpi_overview`，与 `kpi:overview` 口径统一。
+  - `group_audit_closure_ready_rate` 优先采用 `audit-closure` 真值口径，失败时降级兜底。
+- 回归证据：
+  - `test_group_tasks_metrics_contains_kpi_overview_contract`：通过。
+  - `aggregate_group_tasks` 的 `sqlite3.Row` 取值异常已修复并验证。
+- 验收：接口返回字段稳定，能直接被看板消费。
+
+### 24.2 Day 2 发布/回滚 SOP
+- 目标：固化可执行的上线流程与故障应对流程。
+- 发布前检查清单：
+  - 代码基线：主分支无未审阅 diff，版本号与发布说明一致。
+  - 回归检查：`PYTHONWARNINGS="error::ResourceWarning" python3 -m unittest -v test_quality_gate_contract.py` 全绿。
+  - 配置检查：确认 `AGUNT_GROUP_MODE_ENABLED`、数据库路径、API Key 配置与目标环境一致。
+  - 监控检查：`/api/group/tasks/metrics` 与 `/api/group/tasks/kpi:overview` 可访问且返回关键字段。
+  - 回滚预案：回滚责任人、执行命令、通知群组提前确认。
+- 灰度步骤（建议 3 阶段）：
+  - 阶段A（10%）：开启 `AGUNT_GROUP_MODE_ENABLED=true` 于灰度实例，观察 15 分钟。
+  - 阶段B（50%）：扩大流量，重点观察 `group_quality_gate_block_rate` 与错误日志。
+  - 阶段C（100%）：全量切换并记录发布时间点与负责人。
+- 回滚步骤（分钟级）：
+  - 立即切换 `AGUNT_GROUP_MODE_ENABLED=false`，停止新增 Group 流量。
+  - 保留现有任务数据，仅回退流量入口到 V1 单龙虾模式。
+  - 执行健康检查：`/api/group/tasks/metrics`、V1 关键接口、错误日志。
+  - 发布事故记录：故障时间、影响范围、根因、修复动作、复发预防。
+- 故障分级与时限：
+  - P0：核心接口不可用或数据错误扩散，5 分钟内回滚。
+  - P1：功能可用但关键指标异常，30 分钟内降级或局部回滚。
+  - P2：非核心缺陷，纳入当日修复队列。
+- 验收：非研发同学可按文档独立执行发布与回滚。
+
+### 24.3 Day 3 可视化消费最小闭环
+- 目标：先打通“运营视图数据链路”，不追求完整前端。
+- 对接范围：
+  - 看板卡片：`/api/group/tasks/kpi:overview`
+  - 风险列表：`/api/group/tasks/kpi:alerts`
+  - 闭环状态：`/api/group/tasks/{task_id}/audit-closure`
+- 前端对接字段字典（最小集）：
+  - `kpi:overview.overview.total_tasks`：`number`，任务总数；空值约定 `0`。
+  - `kpi:overview.overview.group_task_done_rate`：`number(0~1)`，完成率；空值约定 `0.0`。
+  - `kpi:overview.overview.group_quality_gate_block_rate`：`number(0~1)`，门禁阻断率；空值约定 `0.0`。
+  - `kpi:overview.overview.group_audit_closure_ready_rate`：`number(0~1)`，闭环就绪率；空值约定 `0.0`。
+  - `kpi:overview.overview.group_task_avg_cycle_ms`：`number`，平均周期毫秒；空值约定 `0.0`。
+  - `kpi:alerts.items[].task_id`：`string`，风险任务ID；空值约定 `""`。
+  - `kpi:alerts.items[].severity`：`number`，风险级别（高分优先）；空值约定 `0`。
+  - `kpi:alerts.items[].reasons`：`string[]`，风险原因码；空值约定 `[]`。
+  - `audit-closure.checks.audit_closure_ready`：`boolean`，是否满足闭环；空值约定 `false`。
+  - `audit-closure.checks.trace_mapped`：`boolean`，trace是否映射完成；空值约定 `false`。
+- 渲染建议：
+  - 看板卡片显示 4 个核心率值 + 平均周期。
+  - 风险列表按 `severity` 倒序，首屏显示 `task_id/reasons`。
+  - 闭环状态卡以 `audit_closure_ready` 作为主状态灯。
+- 验收：前端可基于接口完成最小展示与状态判断。
+
+### 24.4 验收标准与完成状态
+- 总验收标准：
+  - 指标可观测：4 个核心指标可稳定输出。
+  - SOP 可执行：发布与回滚步骤可复现。
+  - 可视化可对接：3 组关键接口字段定义完整。
+- 完成状态：
+  - Day 1：`[x]`
+  - Day 2：`[x]`
+  - Day 3：`[x]`

@@ -1,0 +1,836 @@
+OpenClaw 复刻（个人版）— V0 方案（Step 1：模块 / 接口 / 协议）
+版本：V0-Step1
+目标：先跑通“可上线的最小闭环”，并具备可观测能力，便于快速 Debug 与迭代
+入口优先级：Web Chat（主入口）；飞书 Connector 暂不作为阻塞项
+
+
+1. V0 范围冻结（做什么 / 不做什么）
+1.1 V0 必做
+- Web Chat 入口：用户发消息 -> 后端 -> Agent -> 返回（支持流式输出）
+- Orchestrator（Agent Runtime）：单智能体 Agent Loop（plan -> tool -> observe -> respond）
+- Model Layer：统一接入多模型（先接硅基流动 OpenAI 兼容 API；后续再加本地模型）
+- Tool Runtime：最小工具白名单（无副作用优先），支持模型工具调用（tool calling）
+- Storage：会话、回放日志、长期记忆（SQLite 即可）
+- Observability：trace_id 贯穿全链路；记录模型/工具调用、耗时、tokens、错误、重试
+
+1.2 V0 明确不做
+- 系统级接管/浏览器接管/大权限自动化（这是你不安全的核心点，V0 不碰）
+- 复杂插件市场、多智能体协作、复杂权限体系（后续版本再做）
+- 公网多用户体系（V0 先以单用户/本机可用为目标；如果要公网，必须先加鉴权）
+
+
+2. 分层与模块（从外到内）
+2.1 分层结构（职责边界 + 输入输出）
+
+2.1.1 Connector 层（入口适配层：Web Chat / 飞书 / 其他 IM）
+- 核心职责：
+  - 把入口侧消息（用户文本/附件/会话标识）转换成系统统一的 ChatRequest
+  - 把 Orchestrator 输出的 StreamEvent/ChatResponse 转换成入口侧可展示的内容（UI 流式渲染、消息发送等）
+  - 生成 trace_id，并把 trace_id 贯穿传递给后续所有层
+- 允许做的事：
+  - 入口侧的鉴权（V0 可先“本机/内网访问”，公网必加鉴权）
+  - 入口侧的限流/防刷（防止成本失控）
+  - 入口侧格式适配（例如 `/agent` 前缀、消息引用、@提醒等）
+- 禁止做的事（避免耦合）：
+  - 不实现 agent 逻辑、不解析 tool_call、不管理模型路由
+  - 不直接调用模型 API、不直接执行工具
+- 输入：入口侧消息事件
+- 输出：ChatRequest；消费 StreamEvent 并渲染/发送
+
+2.1.2 Orchestrator 层（Agent Runtime：业务编排层）
+- 核心职责：
+  - 实现单智能体 agent loop：构造上下文 -> 调模型 -> 解析输出 ->（必要时）调用工具 -> 继续调模型 -> 结束
+  - 将“工具调用”视为受控能力：校验工具白名单/风险，记录审计，并把 tool_result 回注对话
+  - 将“可观测”作为强制要求：每次模型调用/工具调用/整体执行都要产出 Span
+  - 写入回放数据：保证能复盘每一步模型输入输出与工具执行结果（脱敏）
+- 允许做的事：
+  - 选择使用哪个模型别名（routing），以及失败回退策略
+  - 控制预算：max_steps、time_budget、tool_call_limit、max_tokens
+- 禁止做的事：
+  - 不关心具体 provider 的 API 细节（由 Model Layer 屏蔽）
+  - 不关心具体工具如何实现（由 Tool Runtime 屏蔽）
+- 输入：ChatRequest
+- 输出：StreamEvent 流（优先）；必要时也可输出 ChatResponse
+
+2.1.3 Model Layer（Inference Layer：智能模型层，多模型统一接入）
+- 核心职责：
+  - 统一多模型接口：本地模型、各厂商 API、OpenAI 兼容 API 等在此处“抹平差异”
+  - 统一输出协议：把 provider 的返回转换为统一的 ModelStreamEvent/ModelChatResponse
+  - 统一治理：超时、重试、退避、限流、并发上限、失败回退
+  - 统一能力探测：supports_stream / supports_tools / context_window 等
+- 允许做的事：
+  - 根据 routing policy 选择模型（V0 先手工指定 primary + fallback）
+  - 工具调用兼容：原生 tools/function calling 与“强约束 JSON 输出”两条通道
+- 禁止做的事：
+  - 不做记忆管理、不做工具权限判定、不写业务日志以外的业务状态
+
+2.1.4 Tool Runtime 层（工具执行与权限边界）
+- 核心职责：
+  - 注册工具（name/description/schema/handler）并生成工具 schema 给模型
+  - 执行工具：入参校验、运行隔离（V0 可先目录范围限制/网络白名单预留）、错误封装
+  - 工具权限：白名单/denylist/风险分级（V0 只启用 low 风险工具）
+  - 审计与回放：记录每次工具调用的 name、参数摘要、耗时、结果摘要（脱敏）
+- 禁止做的事：
+  - 不直接与入口交互、不做模型调用
+
+2.1.5 Storage 层（状态与回放落地）
+- 核心职责：
+  - conversation/messages：对话历史（用于上下文拼装）
+  - traces/spans/tool_runs：可观测与回放（用于 debug、复现、质量/成本分析）
+  - memories：长期记忆（V0 可选，先做简单笔记）
+- 约束：
+  - 永不存储密钥/Token/Secret 原文；敏感字段必须脱敏或不落盘
+
+2.1.6 Observability 层（可观测统一出口）
+- 核心职责：
+  - 统一 Trace/Span/Event 结构与写入接口（日志、SQLite、JSONL 等）
+  - 提供最少可用的查询与定位依据：trace_id、span 类型、耗时、错误、tokens
+- 约束：
+  - 观测数据面向 debug 与治理，不承载业务状态（业务状态归 Storage）
+
+2.2 依赖方向（必须单向，避免耦合）
+- Connector -> Orchestrator
+- Orchestrator -> Model Layer / Tool Runtime / Storage / Observability
+- Model Layer -> Provider 实现（SiliconFlow / Local / …）
+- Tool Runtime -> 具体工具实现
+- Storage / Observability -> 不依赖上层（被依赖）
+
+
+3. 核心接口（协议层，语言无关）
+3.1 Connector <-> Orchestrator
+
+3.1.1 ChatRequest（入口到核心的统一请求）
+字段
+- request_id: string（可选）
+  - 语义：入口侧用于幂等/去重的请求标识（例如同一条 IM 事件的 message_id）
+  - 约束：同一入口内建议唯一；Orchestrator 不依赖其全局唯一性
+- trace_id: string（必选）
+  - 语义：一次“用户输入 -> 系统响应”的全链路追踪 ID
+  - 约束：入口层生成；后续所有层必须原样传递并写入观测数据与回放
+- conversation_id: string（必选）
+  - 语义：会话标识。Web Chat 可为浏览器会话/对话线程；IM 可为 chat_id 或者（chat_id + thread_id）
+  - 约束：用于关联 messages/memories/traces；必须稳定且可重复定位历史
+- user_id: string（可选）
+  - 语义：入口侧用户标识（若存在）
+  - 用途：后续版本做权限/配额/个性化；V0 可不使用但要保留字段
+- input_text: string（必选）
+  - 语义：用户输入的纯文本指令
+  - 约束：Connector 应尽量提取为“人类可读文本”，避免携带入口协议噪声
+- attachments: Attachment[]（V0 可留空）
+  - 语义：文件/图片/链接等附加输入
+  - 约束：V0 只定义结构不实现；后续扩展不得破坏兼容性
+- metadata: object（可选）
+  - 语义：入口上下文信息（来源、客户端、语言、时区、用户代理等）
+  - 约束：不得包含密钥；避免放入大体积数据
+
+处理约定
+- Orchestrator 以 trace_id 为主键写入观测与回放；以 conversation_id 关联历史上下文
+- Connector 若检测到明显的无效输入（空文本/过长）可在入口直接拒绝以节省成本
+
+3.1.2 ChatResponse（非流式返回结构）
+字段
+- trace_id: string
+- conversation_id: string
+- output_text: string
+  - 语义：最终给用户看的文本（若入口支持富文本，由 Connector 再做格式转换）
+- usage: Usage（可选）
+  - 语义：本次调用消耗，用于成本核算（prompt/completion/total tokens）
+  - 约束：若 provider 不返回 usage，Model Layer 置空或给出估算标记
+- final_state: object（可选）
+  - 语义：本次执行摘要（例如：是否调用工具、调用次数、停止原因）
+  - 约束：不得包含敏感信息；以 debug 为目的而非业务依赖
+
+3.1.3 StreamEvent（流式统一事件）
+语义
+- Connector 只需消费 StreamEvent 并渲染；无需理解 agent 内部细节
+- StreamEvent 是“最小事件集”，保证不同入口都能统一实现流式展示与错误处理
+字段
+- trace_id: string
+- type: "token" | "tool_call" | "tool_result" | "error" | "done"
+- payload: object
+  - 约束：payload 必须是可序列化对象；Connector 不应丢弃事件，至少要在 debug 模式记录
+
+错误处理约定
+- 当 type=error 时：
+  - recoverable=true：表示系统仍可能继续执行（例如模型重试）；入口可提示“正在重试”
+  - recoverable=false：表示本轮结束；入口应展示失败信息，并建议用户缩小问题/重试
+
+3.2 Orchestrator <-> Model Layer
+
+目标
+- Orchestrator 只关心“对话 + 工具调用”的统一语义；所有厂商差异与本地推理差异由 Model Layer 屏蔽。
+- Model Layer 必须提供可观测数据（model.span 所需字段），并保证流式输出可被统一消费。
+
+3.2.1 数据结构：Message / AssistantMessage
+Message
+- role: "system" | "user" | "assistant" | "tool"
+- content: string（tool 角色也使用字符串，通常为 JSON 字符串）
+- name: string?（可选，用于 tool 角色或兼容某些 provider）
+- tool_call_id: string?（当 role=tool 时必填，用于关联一次 tool_call）
+- attachments: Attachment[]?（V0 预留，不实现）
+
+AssistantMessage
+- role: "assistant"
+- content: string（可为空：当本轮主要输出是 tool_call 时允许空）
+- tool_calls: ToolCall[]?（可选）
+  - call_id: string
+  - name: string
+  - arguments_json: string（原始 JSON 字符串；Model Layer 负责保证是可解析 JSON）
+
+3.2.2 ModelChatRequest（核心到模型层的统一请求）
+字段
+- trace_id: string（必选）
+- conversation_id: string（必选）
+- messages: Message[]（必选）
+  - 约束：由 Orchestrator 控制长度；避免超过模型上下文窗口；V0 采用“最近 N 轮 + system 指令 + 必要回放摘要”策略
+- tools: ToolDefinition[]（可选）
+  - 语义：允许模型调用的工具集合；为空表示不允许工具调用
+- tool_choice: "auto" | "none" | {name: string}（可选）
+  - 语义：auto 允许模型自行决定；none 强制不调用；name 强制只能调用指定工具（用于受控流程）
+- generation: object（可选）
+  - temperature/top_p/max_tokens/stop/stream 等
+  - 约束：stream=true 时 Model Layer 必须走流式输出；stream=false 时返回 ModelChatResponse
+- routing: object（可选）
+  - model_alias: string?（推荐使用逻辑别名，例如 chat_fast / reasoning / tool_use）
+  - policy: string?（V0 可选，例如 "primary_then_fallback"）
+  - 约束：Orchestrator 不直接持有 provider 的 model id；仅传递别名，具体映射由 Model Layer 配置
+
+3.2.3 ModelChatResponse（非流式输出）
+字段
+- trace_id: string
+- message: AssistantMessage
+- usage: Usage?
+  - prompt_tokens/completion_tokens/total_tokens
+  - 约束：若 provider 无法返回 usage，则置空，并在 raw 中保留可推断信息
+- raw: object
+  - 语义：保留 provider 原始响应的最小必要子集，用于排错（禁止包含密钥；必要字段也应可脱敏）
+
+3.2.4 ModelStreamEvent（流式输出统一事件）
+字段
+- trace_id: string
+- type: "token" | "tool_call" | "error" | "done"
+- payload: 见 3.4（注意：tool_result 由 Orchestrator/Tool Runtime 产出，不属于 Model Layer 输出）
+
+事件顺序约定
+- token 事件可多次出现，用于流式展示
+- 当模型需要调用工具时：必须输出至少一个 tool_call 事件，并随后以 done 结束本次模型调用
+- done 事件必须出现一次且仅一次，表示本次模型调用结束，并尽可能携带 usage
+
+3.2.5 工具调用兼容策略（Model Layer 责任）
+- 原生 function calling：解析 provider 的 tool_calls，转换为统一 ToolCall（含 arguments_json）
+- 非原生：通过强约束提示/response_format 让模型输出严格 JSON；若解析失败，Model Layer 执行有限次自恢复重试（写入 retry_count 与错误原因）
+- 约束：Model Layer 输出给 Orchestrator 的 tool_call.arguments_json 必须是可被 JSON 解析的对象字符串
+
+3.2.6 错误与重试（Model Layer 责任）
+- 对可恢复错误（超时、5xx、限流）允许自动重试：
+  - 输出 type=error, recoverable=true 的事件（用于入口提示），并在内部重试
+  - 重试次数受 routing.policy 与全局预算限制（避免无限循环）
+- 对不可恢复错误（鉴权失败、参数错误、模型不存在）：
+  - 输出 type=error, recoverable=false，并尽快 done
+- 所有失败都必须写入 model.span：provider/model/latency_ms/retry_count/error_code
+
+3.3 Orchestrator <-> Tool Runtime
+
+目标
+- 工具是“可控能力边界”，必须默认最小权限：未注册/未在 allowlist 的工具一律不可执行。
+- 工具执行必须可观测、可审计、可回放：能够回答“何时/为何/用什么参数/执行了什么/结果是什么（脱敏）”。
+
+3.3.1 ToolDefinition（提供给模型的工具定义）
+字段
+- name: string
+  - 约束：全局唯一；只允许 [a-zA-Z0-9_]+；不可与保留字冲突
+- description: string
+  - 约束：描述应强调工具边界与限制（例如“只读”“仅限工作目录”）
+- json_schema: object
+  - 语义：严格 JSON Schema（type=object；properties；required）
+  - 约束：禁止可变结构（例如任意 dict）；尽量使用枚举与长度限制，降低误调用风险
+- risk: "low" | "medium" | "high"
+  - 语义：工具风险分级，用于权限与审批
+- side_effect: boolean
+  - 语义：是否会产生外部副作用（写文件、发消息、发网络请求等）
+
+3.3.2 ToolCall（模型到工具层的统一调用）
+字段
+- call_id: string
+  - 语义：本次工具调用的唯一标识，用于关联 tool_result 与回放
+- name: string
+- arguments: object
+  - 约束：必须能通过 ToolDefinition.json_schema 校验；否则不得执行
+
+3.3.3 ToolContext（Orchestrator 传给 Tool Runtime 的执行上下文）
+字段（V0 最小集）
+- trace_id: string
+- conversation_id: string
+- user_id: string?
+- now_ts: int（秒）
+- workspace_root: string（工具允许访问的根目录，V0 用于文件类工具边界）
+- network_policy: object（V0 预留：白名单域名/是否允许出网）
+
+3.3.4 ToolResult（工具执行返回）
+字段
+- call_id: string
+- ok: boolean
+- content: object | string
+  - 约束：必须可 JSON 序列化；推荐对象结构而非自由文本
+- error: object?（仅当 ok=false）
+  - code: string（规范化错误码）
+  - message: string（给开发者/回放看的错误信息）
+  - user_message: string?（可选：更友好的提示，供最终回答使用）
+  - retriable: boolean?（可选：是否建议重试，默认 false）
+
+建议的 error.code（V0 统一枚举）
+- TOOL_NOT_FOUND（未注册）
+- TOOL_NOT_ALLOWED（不在 allowlist / 在 denylist）
+- TOOL_RISK_REJECTED（风险等级不允许，或需要审批但 V0 未实现）
+- TOOL_ARGS_INVALID（参数 schema 校验失败）
+- TOOL_TIMEOUT（执行超时）
+- TOOL_RUNTIME_ERROR（工具内部异常）
+
+3.3.5 ToolPolicy（执行前的权限判定）
+字段
+- allowlist: Set<string>
+- denylist: Set<string>
+- risk_level: {tool_name: "low"|"medium"|"high"}
+- require_approval: Set<string>（V0 可为空；V1 用于“必须二次确认”的工具）
+
+判定顺序（必须固定，便于回放解释）
+1) 未注册 -> TOOL_NOT_FOUND
+2) denylist 命中 -> TOOL_NOT_ALLOWED
+3) allowlist 未命中 -> TOOL_NOT_ALLOWED
+4) 风险等级超过当前会话允许级别 -> TOOL_RISK_REJECTED
+5) schema 校验失败 -> TOOL_ARGS_INVALID
+6) 通过 -> 执行
+
+3.3.6 执行与幂等（防止副作用失控）
+- 超时：每个工具必须有 tool_timeout_ms；超时返回 TOOL_TIMEOUT
+- 幂等：
+  - 对 side_effect=true 的工具，优先设计为幂等（例如使用 idempotency_key=call_id）
+  - V0 若暂不实现幂等键，至少在回放中标注 side_effect=true，并限制此类工具默认禁用
+
+3.3.7 审计、脱敏与回放（强制要求）
+- Tool Runtime 必须输出 tool.span：tool_name/allowed/latency_ms/ok/error.code
+- 回放落地必须包含：
+  - trace_id, conversation_id, call_id, tool_name
+  - arguments_json（脱敏后），result_json（脱敏后）
+  - side_effect, risk, allowed/denied 原因
+- 脱敏规则（V0 最小集）：
+  - 对包含 key/token/secret/password 字段的入参或结果，一律用 "***" 替换
+  - 对疑似长文本/文件内容，仅保存摘要（长度、hash、前 N 字符）
+
+3.4 StreamEvent.payload 结构（统一，严格定义）
+
+目标
+- StreamEvent 是入口可消费的最小事件协议：Web Chat/IM/CLI 都能统一展示。
+- StreamEvent 同时用于回放：必须足够表达“模型输出了什么、调用了什么工具、哪里失败、何时结束”。
+
+通用约束
+- 所有 payload 必须是 JSON 可序列化对象（不允许二进制）。
+- 任意事件都必须带 trace_id（在 StreamEvent 顶层）。
+- Connector 不需要理解内部逻辑，但必须按序渲染事件，且在 debug 模式保留原始事件序列。
+
+3.4.1 token 事件
+语义
+- 表示 assistant 文本的流式增量输出。
+字段
+- delta: string
+  - 约束：可为空（某些 provider 可能发送空增量）；Connector 可忽略空 delta
+
+最小示例
+- {"type":"token","payload":{"delta":"你好"}}
+
+3.4.2 tool_call 事件
+语义
+- 表示模型请求调用某个工具（注意：执行工具不在此事件内完成）。
+字段
+- call_id: string
+  - 约束：同一 trace 内唯一；用于关联后续 tool_result
+- name: string
+  - 约束：必须是 ToolDefinition.name；否则 Orchestrator 将拒绝执行并产生 tool_result(ok=false)
+- arguments_json: string
+  - 语义：工具参数的原始 JSON 字符串（便于回放与签名校验）
+  - 约束：必须可解析为 JSON object；若不可解析，Model Layer 应优先自恢复重试；若仍失败，Orchestrator 视为 TOOL_ARGS_INVALID
+
+最小示例
+- {"type":"tool_call","payload":{"call_id":"c1","name":"recall","arguments_json":"{\"limit\":5}"}}
+
+3.4.3 tool_result 事件
+语义
+- 表示一次工具调用的执行结果（由 Orchestrator/Tool Runtime 产出）。
+字段
+- call_id: string
+- ok: boolean
+- content_json: string
+  - 语义：工具执行结果的 JSON 字符串
+  - 约束：必须可解析为 JSON（object 或 string 包装对象均可，但推荐 object）
+- error: object?（仅当 ok=false，可选但推荐）
+  - code: string（参考 3.3.4 error.code）
+  - message: string
+
+最小示例
+- {"type":"tool_result","payload":{"call_id":"c1","ok":true,"content_json":"{\"notes\":[\"...\"]}"}}
+- {"type":"tool_result","payload":{"call_id":"c2","ok":false,"content_json":"{}","error":{"code":"TOOL_NOT_ALLOWED","message":"tool not in allowlist"}}}
+
+3.4.4 error 事件
+语义
+- 表示本轮执行过程中出现错误。
+- 该事件既可由 Model Layer 产出（模型调用失败/重试提示），也可由 Orchestrator 产出（预算耗尽/流程错误）。
+字段
+- message: string
+  - 语义：面向用户可展示的错误摘要（避免泄露内部信息与密钥）
+- recoverable: boolean
+  - 语义：是否仍可能继续执行
+  - 约束：recoverable=true 时，系统后续应继续输出 token/tool_call/tool_result 或最终 done
+- stage: "connector"|"orchestrator"|"model"|"tool"?（可选）
+  - 语义：错误发生在哪一层，便于定位
+- trace_hint: string?（可选）
+  - 语义：给排错用的短提示（例如“model timeout after 30s”），不得包含密钥
+
+最小示例
+- {"type":"error","payload":{"message":"模型请求超时，正在重试…","recoverable":true,"stage":"model"}}
+- {"type":"error","payload":{"message":"本轮执行失败：工具不被允许。","recoverable":false,"stage":"tool"}}
+
+3.4.5 done 事件
+语义
+- 表示本轮响应已结束。Connector 收到 done 后应关闭流并允许用户发起下一轮。
+字段
+- usage: {prompt_tokens:int?, completion_tokens:int?, total_tokens:int?}?（可选）
+  - 约束：若未知可省略；不得伪造精确值
+- stop_reason: string?（可选）
+  - 语义：结束原因，便于 debug，例如："completed" | "max_steps" | "time_budget" | "model_error" | "tool_error"
+
+最小示例
+- {"type":"done","payload":{"usage":{"prompt_tokens":123,"completion_tokens":456,"total_tokens":579},"stop_reason":"completed"}}
+
+3.4.6 事件序列规则（保证入口一致体验）
+- 正常情况：若有文本输出，token 可出现 0..N 次，最后必须出现 done。
+- 工具调用情况：tool_call 可出现 1..N 次；每个 tool_call 必须对应 0..1 个 tool_result（V0 要求 1 个），并最终 done。
+- 错误情况：error 可出现 1..N 次；若 recoverable=false，后续应尽快 done。
+- 任何 trace 在一次用户输入下，done 必须出现且仅出现一次。
+
+
+4. Model Layer 的兼容策略（关键点，细化版）
+
+目标
+- 统一接入多模型（本地/厂商/OpenAI 兼容），对上层暴露一致的 chat/stream/tools 语义。
+- 在 Model Layer 解决“差异、治理、观测”，让 Orchestrator 只做业务编排。
+
+4.1 配置与模型别名（model_alias）
+- 配置是 Model Layer 的唯一“真相来源”，Orchestrator 只传 model_alias，不传具体厂商 model id。
+- 每个 model_alias 至少需要：
+  - provider: string（例如 siliconflow / openai / ollama / llama_cpp）
+  - model: string（provider 侧的真实模型名）
+  - base_url: string?（OpenAI 兼容或本地推理）
+  - api_key_ref: string?（仅引用环境变量名，不在配置里写明文）
+  - defaults: {temperature, top_p, max_output_tokens, stop}?（可选）
+  - capabilities: {supports_stream, supports_tools, context_window_tokens}?（可选；也可运行时探测并缓存）
+  - limits: {timeout_ms, max_retries, concurrency, rpm, tpm}?（可选，治理用）
+
+4.2 路由与回退（routing.policy）
+- V0 固定支持策略：primary_then_fallback
+  - primary: model_alias
+  - fallback: model_alias（仅当 primary 遇到可恢复错误或明确的“模型不可用”时启用）
+- Orchestrator 的 routing.policy 只能选择策略名；具体“哪些错误可回退”由 Model Layer 统一定义。
+
+可回退错误（建议）
+- 超时、连接失败、5xx、429（限流）
+不可回退错误（建议）
+- 401/403（鉴权/配额问题）、4xx 参数错误、模型不存在（除非 fallback 明确是另一个 provider）
+
+4.3 限流、并发与重试
+- 目标：防止成本失控与雪崩；避免入口并发时把 provider 打挂。
+- 并发：按 model_alias 设置并发上限（semaphore）。
+- 限流：支持 rpm/tpm（V0 可先做 rpm 或仅并发）。
+- 重试：仅对可恢复错误重试，采用指数退避 + 抖动；重试次数写入 model.span.retry_count。
+- 超时：timeout_ms 必须配置；超时属于可恢复错误，但重试次数要受 time_budget 约束。
+
+4.4 工具调用兼容（tools/function calling）
+- 两条通道原则不变，但细化责任边界：
+  - 原生 tools：解析 provider tool_calls -> 产出统一 ToolCall(call_id/name/arguments_json)
+  - 非原生：使用强约束输出（提示/response_format）-> 解析 JSON -> schema 预校验（可选）
+- 约束：输出给 Orchestrator 的 ToolCall.arguments_json 必须可解析为 JSON object；否则应在 Model Layer 内部进行有限次自恢复。
+
+4.5 流式兼容（streaming）
+- Model Layer 必须把 provider 的流式协议转换为 ModelStreamEvent：token/tool_call/error/done。
+- 要求：done 必须出现一次且仅一次；error 可出现多次；token 可为空但顺序必须稳定。
+- V0 推荐：token 以最小增量转发；避免把 provider 的内部事件结构暴露到上层。
+
+4.6 可观测（model.span 强制要求）
+- 每次模型调用必须写 model.span，至少包含：
+  - provider, model, latency_ms, retry_count, status
+  - usage（若可得）
+  - error_code/error_message（若失败；不得包含密钥）
+- 失败回退发生时：
+  - primary 与 fallback 都要各自写 span
+  - 在 Trace.stop_reason 或 Span.attrs 中记录“发生回退”标记（用于排错/统计）
+
+
+5. Orchestrator（Agent Loop）标准执行序列（V0，细化版）
+输入：ChatRequest
+输出：StreamEvent 流（优先）/ ChatResponse（非流式）
+
+5.1 执行步骤（必须可回放）
+0) 初始化与建链
+- 生成/接收 trace_id，并创建 orchestrator.span(start)
+- 将本轮 user 输入写入 Storage.messages（role=user, content=input_text）
+- 写入 Trace 基础信息：conversation_id、user_id、入口 metadata（脱敏）
+
+1) 组装上下文（Context Builder）
+- 从 Storage 读取最近 N 轮消息（V0：仅 role=user/assistant/tool；忽略入口噪声）
+- 拼接 system 指令（包含：工具边界、预算约束、输出风格、禁止泄露密钥）
+- 选择 tools schema：
+  - V0 默认只提供 allowlist 且 risk=low 的工具
+  - 若用户明确要求“不使用工具”，Orchestrator 可将 tools 置空并 tool_choice=none
+
+2) 进入 agent loop（最多 max_steps 次）
+每一轮包含：
+- 2.1 调用模型：向 Model Layer 发送 ModelChatRequest(stream=true)
+  - 写 model.span：provider/model/latency_ms/retry_count/usage/error
+- 2.2 消费 ModelStreamEvent：
+  - token：透传为 StreamEvent(token)，并同时写入回放（只存增量文本，必要时可合并）
+  - tool_call：进入 2.3
+  - error：透传为 StreamEvent(error)；若 recoverable=false 则准备结束
+  - done：表示本次模型调用结束；若本次没有 tool_call 且已有最终文本，则准备结束
+
+3) 工具调用（当出现 tool_call）
+- 3.1 解析与校验：
+  - arguments_json 必须可解析为 object；否则产生 tool_result(ok=false, TOOL_ARGS_INVALID)
+  - 按 ToolPolicy 判定 allow/deny，并记录“拒绝原因”到回放
+- 3.2 执行：调用 Tool Runtime（带 ToolContext）
+  - 写 tool.span：tool_name/allowed/latency_ms/ok/error.code
+- 3.3 产出 tool_result 事件：
+  - 透传为 StreamEvent(tool_result)
+  - 将 tool_result 以 role=tool 的 Message 回注到 messages（含 tool_call_id=call_id）
+- 3.4 回到 2) 继续下一轮模型调用（让模型基于 tool_result 继续推理/总结）
+
+4) 结束与落盘
+- 必须输出一次 StreamEvent(done)
+- 将最终 assistant 文本写入 Storage.messages（role=assistant）
+- 将本轮 usage、stop_reason、step_count 写入 Trace/Span
+
+5.2 停止条件与 stop_reason（必须枚举化）
+stop_reason 可选值（V0 固定集合，便于统计与排错）
+- completed：模型给出最终文本并 done
+- max_steps：达到最大循环步数
+- tool_call_limit：达到工具调用次数上限
+- time_budget：超过整轮时间预算
+- max_tokens：输出触达上限或被 provider 截断
+- model_error：模型层不可恢复错误
+- tool_error：工具层不可恢复错误（或被拒绝且无法继续）
+- user_cancelled：入口主动中断（V0 预留）
+
+5.3 V0 保护阈值（建议默认值，后续可配置）
+- max_steps：4
+- tool_call_limit：6
+- time_budget_ms：60000
+- tool_timeout_ms：10000（每个工具单独超时）
+- max_output_tokens：由 Model Layer 透传控制（并在回放中记录）
+
+
+6. 可观测（Observability）协议（V0 必做，细化版）
+
+目标
+- 任何一次用户输入，都能通过 trace_id 复盘：模型输入输出、工具调用链、错误点、预算消耗。
+- 可观测数据既服务 debug，也服务治理（成本、失败率、工具滥用等）。
+
+6.1 Trace（一次用户输入的全链路记录）
+字段（建议）
+- trace_id: string（必选）
+- conversation_id: string（必选）
+- user_id: string?（可选）
+- request_id: string?（可选，入口幂等用）
+- start_ts_ms: int（必选）
+- end_ts_ms: int?（结束时写入）
+- status: "ok" | "error"（必选）
+- stop_reason: string?（结束时写入，见 5.2）
+- step_count: int?（结束时写入）
+- usage: Usage?（可选，若可获得则记录）
+- input_summary: object?（可选，脱敏：长度、hash、前 N 字）
+- metadata: object?（可选，入口信息；必须脱敏；避免大对象）
+
+6.2 Span（时间片段，定位瓶颈与错误）
+通用字段
+- trace_id: string
+- span_id: string
+- parent_span_id: string?
+- kind: "orchestrator" | "model" | "tool"
+- name: string（例如 "agent_loop" / "chat_completion" / "tool.recall"）
+- start_ts_ms: int
+- end_ts_ms: int
+- status: "ok" | "error"
+- error_code: string?（可选）
+- error_message: string?（可选，严禁包含密钥）
+
+orchestrator.span（至少 1 个）
+- step_count: int
+- stop_reason: string
+- budgets: {max_steps, tool_call_limit, time_budget_ms}
+
+model.span（每次模型调用 1 个）
+- provider: string（例如 siliconflow/local）
+- model: string（最终实际模型名）
+- retry_count: int
+- latency_ms: int
+- usage: Usage?（可选）
+
+tool.span（每次工具调用 1 个）
+- tool_name: string
+- allowed: boolean
+- latency_ms: int
+- ok: boolean
+- error_code: string?
+
+6.3 回放事件（建议与 Observability 一起落地）
+- 事件序列建议与 StreamEvent 一致存储：token/tool_call/tool_result/error/done
+- 约束：token 事件可合并；tool_call/tool_result/error/done 必须逐条保存
+
+6.4 落地与查询（V0 推荐 SQLite）
+推荐表（最小可用）
+- traces(trace_id PRIMARY KEY, conversation_id, start_ts_ms, end_ts_ms, status, stop_reason, step_count, usage_json, metadata_json)
+- spans(span_id PRIMARY KEY, trace_id, parent_span_id, kind, name, start_ts_ms, end_ts_ms, status, attrs_json)
+- messages(id, conversation_id, role, content, ts_ms, trace_id?)
+- tool_runs(call_id, trace_id, conversation_id, tool_name, allowed, ok, args_json, result_json, error_code, ts_ms)
+
+查询方式（面向不懂代码的排错）
+- 先用 trace_id 查 traces：确认 stop_reason、总耗时、status
+- 再按 trace_id 查 spans：定位是 model 慢、tool 慢还是 orchestrator 循环超限
+- 再按 trace_id 查 tool_runs：看是否被 TOOL_NOT_ALLOWED / TOOL_ARGS_INVALID 拒绝
+
+安全约束（必须）
+- 不得记录任何密钥、token、secret 原文；疑似敏感字段统一脱敏为 "***"
+
+
+7. 存储（Storage）对象（V0，细化版）
+
+目标
+- 支撑三件事：上下文（messages）、长期记忆（memories，可选）、排错与治理（traces/spans/tool_runs + 回放事件）。
+- 所有落盘内容必须默认可回放、可检索、可脱敏。
+
+7.1 conversations（会话信息）
+语义
+- 表示一个稳定的对话线程，用于关联 messages/memories/traces。
+建议字段
+- conversation_id: string（主键）
+- created_ts_ms: int
+- last_active_ts_ms: int
+- title: string?（可选，V0 可由第一条用户输入摘要生成）
+- metadata_json: object?（入口信息摘要，脱敏）
+
+索引建议
+- (last_active_ts_ms)
+
+7.2 messages（对话消息，供上下文拼装）
+语义
+- 仅存“必要的可复现内容”：用户输入、assistant 输出、tool 结果（以 JSON 字符串形式）。
+建议字段
+- id: int（自增）
+- conversation_id: string（索引）
+- trace_id: string?（可选：把消息与一次执行绑定，便于回放定位）
+- role: "user"|"assistant"|"tool"|"system"（V0 可不落 system）
+- content: string（tool 结果建议为 JSON 字符串；大文本需摘要策略）
+- ts_ms: int
+- tool_call_id: string?（当 role=tool）
+
+索引建议
+- (conversation_id, ts_ms)
+- (trace_id)
+
+保留策略（建议）
+- messages 默认长期保存，但对超长 content 采用“摘要 + hash”策略，避免 DB 膨胀。
+
+7.3 memories（长期记忆，可选）
+语义
+- 与 conversation 相关的长期笔记/事实，不等同于 messages。
+建议字段
+- id: int
+- conversation_id: string
+- kind: string（例如 "note" | "preference" | "todo"，V0 可只用 "note"）
+- content: string（短文本）
+- ts_ms: int
+
+索引建议
+- (conversation_id, ts_ms)
+
+7.4 traces（一次用户输入的一次执行总览）
+语义
+- trace 是“排错入口”：先查 trace，再查 spans/tool_runs/events。
+建议字段
+- trace_id: string（主键）
+- conversation_id: string
+- user_id: string?
+- request_id: string?
+- start_ts_ms: int
+- end_ts_ms: int?
+- status: "ok"|"error"
+- stop_reason: string?
+- step_count: int?
+- usage_json: object?
+- metadata_json: object?（脱敏）
+- input_summary_json: object?（脱敏）
+
+索引建议
+- (conversation_id, start_ts_ms)
+
+7.5 spans（性能与错误定位）
+语义
+- 每一次 orchestrator/model/tool 动作都应有 span。
+建议字段
+- span_id: string（主键）
+- trace_id: string（索引）
+- parent_span_id: string?
+- kind: string
+- name: string
+- start_ts_ms: int
+- end_ts_ms: int
+- status: string
+- attrs_json: object（扩展字段，包含 provider/model/tool_name/retry_count 等）
+
+索引建议
+- (trace_id)
+
+7.6 tool_runs（工具调用明细）
+语义
+- 工具是风险边界，必须单独表记录“允许/拒绝原因 + 参数摘要 + 结果摘要”。
+建议字段
+- call_id: string（主键）
+- trace_id: string
+- conversation_id: string
+- tool_name: string
+- risk: string
+- side_effect: boolean
+- allowed: boolean
+- ok: boolean
+- args_json: string（脱敏后）
+- result_json: string（脱敏后）
+- error_code: string?
+- error_message: string?
+- ts_ms: int
+
+索引建议
+- (trace_id)
+- (conversation_id, ts_ms)
+
+7.7 replay_events（回放事件序列，推荐）
+语义
+- 保存 StreamEvent 序列，用于复现“当时发生了什么”。
+- token 事件可合并，tool_call/tool_result/error/done 必须逐条保存。
+建议字段
+- id: int
+- trace_id: string
+- seq: int（递增序号）
+- type: string
+- payload_json: string（脱敏后）
+- ts_ms: int
+
+索引建议
+- (trace_id, seq)
+
+7.8 脱敏与大对象策略（强制）
+- 命中以下 key 名（不区分大小写）时，值必须替换为 "***"：key/token/secret/password/authorization
+- 对疑似文件内容、网页全文、模型长输出：只存摘要（len、sha256、前 N 字符）
+- 对 attachments：V0 不落盘原始二进制，仅落“文件名/大小/hash/存放路径（若有）”
+
+
+8. 安全与密钥管理（硬性约束，细化版）
+
+目标
+- 最小权限：默认不出网、不写入工作区外、不执行高风险工具。
+- 不泄密：密钥永不落盘，日志/回放/错误信息中永不出现密钥原文。
+- 可追责：任何模型调用与工具调用都能通过 trace_id 追踪，但追踪信息必须脱敏。
+
+8.1 密钥与凭证（Secret）来源
+允许的来源（V0）
+- 环境变量（首选）
+- 本机系统密钥管理（例如 Keychain/凭证管理器，由运维或用户自行配置）
+
+禁止的来源（硬禁）
+- 任何仓库文件（包括 .txt/.md/.json/.yaml/.env 被提交到版本库）
+- 任何回放/日志/trace/span/message/tool_run 的 content 或 attrs
+- 任何前端页面可直接读取的配置（避免把 key 下发到浏览器）
+
+8.2 密钥命名约定（便于审计与脱敏）
+- 所有密钥只用“引用名”出现在配置中，例如 api_key_ref="SILICONFLOW_API_KEY"
+- 真实密钥只存在于运行环境变量中
+
+8.3 脱敏规则（覆盖所有输出通道）
+适用范围（必须覆盖）
+- Observability：traces/spans
+- Replay：replay_events
+- Storage：messages/tool_runs/memories
+- 运行日志：stdout/文件日志
+- 错误信息：error.message/trace_hint/异常堆栈（若有）
+
+脱敏规则（V0 最小集，命中即替换）
+- key/token/secret/password/authorization/cookie/session（不区分大小写）字段值 -> "***"
+- Bearer/Basic 等鉴权头的值 -> "***"
+- URL 中包含 api_key/token/key 参数 -> 值替换为 "***"
+
+8.4 默认权限边界（V0 强制默认）
+网络
+- 默认：网络工具关闭（network_policy.allow=false）
+- 若必须开启：只能访问白名单域名（network_policy.allowlist），且必须在回放中记录“访问了哪个域名”（不记录 query 中的敏感参数）
+
+文件系统
+- 默认：只允许访问 workspace_root（见 3.3.3 ToolContext.workspace_root）
+- 禁止访问：workspace_root 之外路径、用户主目录敏感文件、系统目录
+- 读写策略：V0 默认只允许只读工具；写工具即使存在也必须在 denylist
+
+执行环境
+- 禁止：执行任意 shell 命令、运行不受控子进程、加载任意动态脚本
+
+8.5 输出安全（对用户可见内容）
+- 模型输出必须避免：
+  - 提示用户粘贴/暴露密钥
+  - 回显用户提供的密钥（即使用户主动发来，也应提醒其撤销并脱敏展示）
+- 当检测到用户输入疑似密钥时：
+  - 在最终回答中提示“已检测到敏感信息，建议立即撤销/重置”，并拒绝在后续流程中继续使用该密钥文本
+
+8.6 开发与上线检查清单（V0 必过）
+- 仓库扫描：无任何 APP_SECRET/API_KEY 出现在任意文件中
+- 运行检查：所有 provider 的 api_key 仅来自环境变量或系统密钥
+- 日志检查：trace/span/tool_runs/messages/replay_events 中不含密钥原文
+- 权限检查：allowlist 仅包含 risk=low 且 side_effect=false 的工具
+- 网络检查：默认不出网；开启白名单访问必须显式配置并可追踪
+
+8.7 事故处置原则（V0 约定）
+- 一旦怀疑密钥泄露：立即撤销/轮换密钥；保留 trace_id 以定位泄露路径（仅保留脱敏信息）
+- 任何“为了排错临时打印密钥”的做法都是禁止项
+
+
+9. 下一步（Step 2：目录与文件拆分）
+基于本方案，下一步将产出：
+- 项目目录结构（每层一个 package）
+- 每个模块的文件清单与职责
+- 依赖方向检查（保证不会出现上层依赖下层实现的反向耦合）
+
+
+10. V0 产品功能补充（用户视角）
+10.1 会话生命周期（强制）
+- active：正常可见、可继续对话。
+- archived：仅隐藏，不删除数据，可恢复到 active。
+- deleted：进入回收站，默认保留 7 天，可恢复。
+- purged：彻底删除，不可恢复。
+
+10.2 删除策略（强制）
+- 单条会话必须支持：归档、删除到回收站、彻底删除。
+- 批量操作必须支持：批量归档、批量删除到回收站、清空全部（purged）。
+- 删除确认弹窗必须明确提示“是否可恢复”。
+
+10.3 附件最小可用范围（V0 必做）
+- 支持上传附件并在会话中显示状态：上传中/已就绪/失败。
+- 落盘仅元数据：文件名、大小、hash、存放路径（若有）、上传时间。
+- 不落盘原始二进制到业务回放表；回放中仅保留附件摘要。
+
+10.4 用户可见运行状态（V0 必做）
+- 统一状态：processing / retrying / failed / done / cancelled。
+- failed 时必须提供可读错误摘要与“重试”入口。
+- retrying 时前端必须显示“正在重试”，并在 done/failed 后关闭状态。
+
+10.5 记忆治理（V0 必做）
+- 用户可查看当前会话记忆列表。
+- 用户可删除指定记忆，并可关闭后续记忆写入。
+
+10.6 V0 PRD 验收口径（最小）
+- 会话管理：支持搜索、批量归档、批量删除、恢复。
+- 交互可靠性：支持停止生成、失败重试、断线后可继续使用。
+- 输出可读性：长回答可折叠，代码块可复制。
+- 安全：本机可免鉴权；公网模式必须开启 API Key。

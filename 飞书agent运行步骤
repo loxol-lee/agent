@@ -1,0 +1,4 @@
+1、https://ominous-meme-4jwjg9p56x7xcgw.github.dev/  登入
+2、(cd echo_bot/python && BASE_DOMAIN=https://open.feishu.cn APP_ID=cli_a92d0273a238dbd8 APP_SECRET=nXeOyagn5pNFKAoGjkfvfc4SB477JW14  ./bootstrap.sh) 下面终端运行这个
+(cd echo_bot/python && BASE_DOMAIN=https://open.feishu.cn APP_ID=cli_a9229a0c99211bcd APP_SECRET=75dYFCZFAdd6FRdODIHtfb8ZAgreYTU5  ./bootstrap.sh) 这是硅来的PM
+3、飞书与（Li的十万个为什么）对话时使用/agent 开头

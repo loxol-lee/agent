@@ -94,12 +94,45 @@ def build_group_kpi_alerts(items: list[dict], limit: int) -> tuple[list[dict], i
     return alerts[:limit_v], limit_v
 
 
-def build_group_kpi_overview(items: list[dict]) -> dict:
+def build_group_kpi_overview(items: list[dict], cycle_ms_values: list[int] | None = None, audit_closure_ready_tasks: int | None = None) -> dict:
     total = len(items)
     qg_pass = sum(1 for x in items if bool((x.get("kpi") or {}).get("quality_gate_pass")))
     ready = sum(1 for x in items if bool((x.get("kpi") or {}).get("approve_ready")))
     changed = sum(int((x.get("kpi") or {}).get("changed_files_count") or 0) for x in items)
-    return {"total_tasks": total, "quality_gate_pass_tasks": qg_pass, "approve_ready_tasks": ready, "quality_gate_pass_rate": (float(qg_pass) / float(total)) if total > 0 else 0.0, "approve_ready_rate": (float(ready) / float(total)) if total > 0 else 0.0, "avg_changed_files_count": (float(changed) / float(total)) if total > 0 else 0.0}
+    done_tasks = sum(1 for x in items if str(x.get("status") or "") == "done")
+    blocked_tasks = sum(1 for x in items if not bool((x.get("kpi") or {}).get("quality_gate_pass")))
+    closure_ready = audit_closure_ready_tasks
+    if closure_ready is None:
+        closure_ready = 0
+        for x in items:
+            k = dict(x.get("kpi") or {})
+            if (
+                str(x.get("status") or "") == "done"
+                and bool(k.get("quality_gate_pass"))
+                and int(k.get("thread_messages_count") or 0) > 0
+                and int(k.get("rounds_count") or 0) > 0
+                and int(k.get("decisions_count") or 0) > 0
+                and int(k.get("changed_files_count") or 0) > 0
+            ):
+                closure_ready += 1
+    cycle_values = [int(v) for v in list(cycle_ms_values or []) if int(v) >= 0]
+    avg_cycle_ms = (float(sum(cycle_values)) / float(len(cycle_values))) if cycle_values else 0.0
+    return {
+        "total_tasks": total,
+        "quality_gate_pass_tasks": qg_pass,
+        "approve_ready_tasks": ready,
+        "quality_gate_pass_rate": (float(qg_pass) / float(total)) if total > 0 else 0.0,
+        "approve_ready_rate": (float(ready) / float(total)) if total > 0 else 0.0,
+        "avg_changed_files_count": (float(changed) / float(total)) if total > 0 else 0.0,
+        "group_task_done_tasks": done_tasks,
+        "group_task_done_rate": (float(done_tasks) / float(total)) if total > 0 else 0.0,
+        "group_quality_gate_block_tasks": blocked_tasks,
+        "group_quality_gate_block_rate": (float(blocked_tasks) / float(total)) if total > 0 else 0.0,
+        "group_audit_closure_ready_tasks": int(closure_ready),
+        "group_audit_closure_ready_rate": (float(closure_ready) / float(total)) if total > 0 else 0.0,
+        "group_task_avg_cycle_ms": avg_cycle_ms,
+        "group_task_cycle_samples": len(cycle_values),
+    }
 
 
 def build_group_kpi_owners(items: list[dict], top: int, min_tasks: int) -> tuple[list[dict], int, int]:
@@ -174,11 +207,39 @@ def handle_group_tasks_kpi_alerts(*, limit: int, owner_id: str | None, status: s
     return {"ok": True, "limit": limit_v, "total": len(out_items), "filters": {"owner_id": (str(owner_id).strip() if owner_id is not None else None), "status": (str(status).strip() if status is not None else None), "phase": (str(phase).strip() if phase is not None else None)}, "items": out_items}
 
 
-def handle_group_tasks_kpi_overview(*, owner_id: str | None, status: str | None, phase: str | None, list_tasks: Callable[..., list[dict]], fetch_kpi: Callable[[str], dict]) -> dict:
+def handle_group_tasks_kpi_overview(*, owner_id: str | None, status: str | None, phase: str | None, list_tasks: Callable[..., list[dict]], fetch_kpi: Callable[[str], dict], fetch_audit_closure: Callable[[str], dict] | None = None) -> dict:
     rows = list_tasks(limit=200, status=status, phase=phase, owner_id=owner_id)
     ids = [str(r.get("task_id") or "") for r in rows if str(r.get("task_id") or "")]
     items, _ = collect_group_kpi_items(ids, None, fetch_kpi)
-    return {"ok": True, "filters": {"owner_id": (str(owner_id).strip() if owner_id is not None else None), "status": (str(status).strip() if status is not None else None), "phase": (str(phase).strip() if phase is not None else None)}, "overview": build_group_kpi_overview(items)}
+    cycle_ms_values: list[int] = []
+    for r in rows:
+        try:
+            created = int(r.get("created_at_ms") or 0)
+            finished = int(r.get("finished_at_ms") or 0)
+        except (TypeError, ValueError):
+            continue
+        if created > 0 and finished >= created:
+            cycle_ms_values.append(finished - created)
+    closure_ready_tasks: int | None = None
+    if callable(fetch_audit_closure):
+        closure_ready_tasks = 0
+        for tid in ids:
+            try:
+                out = fetch_audit_closure(tid)
+                checks = dict(out.get("checks") or {}) if isinstance(out, dict) else {}
+                if bool(checks.get("audit_closure_ready")):
+                    closure_ready_tasks += 1
+            except HTTPException:
+                continue
+    return {
+        "ok": True,
+        "filters": {
+            "owner_id": (str(owner_id).strip() if owner_id is not None else None),
+            "status": (str(status).strip() if status is not None else None),
+            "phase": (str(phase).strip() if phase is not None else None),
+        },
+        "overview": build_group_kpi_overview(items, cycle_ms_values, closure_ready_tasks),
+    }
 
 
 def handle_group_tasks_kpi_owners(*, top: int, min_tasks: int, status: str | None, phase: str | None, list_tasks: Callable[..., list[dict]], fetch_kpi: Callable[[str], dict]) -> dict:

@@ -1,0 +1,231 @@
+(base) lixiaoyi@lixiaoyideMacBook-Pro src % python3 -m unittest -v test_quality_gate_contract.
+py
+test_export_blocks_on_contract_drift_even_when_gate_off (test_quality_gate_contract.QualityGateContractTests.test_export_blocks_on_contract_drift_even_when_gate_off) ... ok
+test_export_contains_contract_fields (test_quality_gate_contract.QualityGateContractTests.test_export_contains_contract_fields) ... ok
+test_export_security_checks_accumulate (test_quality_gate_contract.QualityGateContractTests.test_export_security_checks_accumulate) ... ok
+test_quality_gate_blocks_on_contract_drift (test_quality_gate_contract.QualityGateContractTests.test_quality_gate_blocks_on_contract_drift) ... ok
+test_quality_gate_blocks_on_security_integrity (test_quality_gate_contract.QualityGateContractTests.test_quality_gate_blocks_on_security_integrity) ... /Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de2f20>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3010>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de32e0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de33d0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de34c0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de35b0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de36a0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3790>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3880>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3970>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3a60>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3b50>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3c40>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3d30>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3e20>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x110de3f10>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c040>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c130>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c220>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c310>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c400>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c6d0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c7c0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c8b0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102c9a0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102ca90>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102cb80>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102cc70>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102cd60>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102ce50>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102cf40>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d030>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d120>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d210>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d300>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d3f0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d4e0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d5d0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d6c0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d7b0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d8a0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102d990>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102da80>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102db70>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102dc60>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102dd50>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102de40>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102df30>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e020>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e110>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e200>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e2f0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e3e0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e4d0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e7a0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e890>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102e980>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102ea70>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102eb60>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102ec50>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102ed40>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102ee30>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102ef20>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f010>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f100>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f1f0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f2e0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f3d0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f4c0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f5b0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f6a0>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f790>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/lixiaoyi/Documents/newtext/agunt/apps/server/src/connectors/web/routes.py:553: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x11102f880>
+  if any((cid not in tool_run_call_ids) for cid in replay_tool_result_call_ids):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.044s
+
+OK

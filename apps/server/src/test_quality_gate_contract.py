@@ -462,6 +462,59 @@ class QualityGateContractTests(unittest.TestCase):
         self.assertEqual(e.exception.status_code, 400)
         self.assertEqual((e.exception.detail or {}).get("code"), "GROUP_KPI_SORT_BY_INVALID")
 
+    def test_group_tasks_metrics_contains_kpi_overview_contract(self) -> None:
+        c1 = routes.api_group_task_create(request=self.req, body=routes.GroupTaskCreateIn(goal="metrics contract #1", owner_id="owner"))
+        c2 = routes.api_group_task_create(request=self.req, body=routes.GroupTaskCreateIn(goal="metrics contract #2", owner_id="owner"))
+        t1 = str(c1.get("task_id"))
+        _ = str(c2.get("task_id"))
+
+        self._advance_group_task_to_decision(t1)
+        self.store.insert_group_agent_message(t1, 4, "qa", "qa", "metrics", "{}")
+        self.store.insert_group_decision(t1, "approve", "p1", "ok", "owner")
+        self.store.upsert_group_artifacts(t1, {"changed_files": ["apps/server/src/a.py"], "test_result": "qa_passed", "summary": "ok"})
+
+        metrics_out = routes.api_group_tasks_metrics(request=self.req, owner_id="owner")
+        overview_out = routes.api_group_tasks_kpi_overview(request=self.req, owner_id="owner")
+
+        self.assertTrue(metrics_out.get("ok"))
+        self.assertTrue(overview_out.get("ok"))
+
+        metrics = dict(metrics_out.get("metrics") or {})
+        kpi_overview = dict(metrics.get("kpi_overview") or {})
+        self.assertEqual(kpi_overview, dict(overview_out.get("overview") or {}))
+
+        required_keys = {
+            "total_tasks",
+            "quality_gate_pass_tasks",
+            "approve_ready_tasks",
+            "quality_gate_pass_rate",
+            "approve_ready_rate",
+            "avg_changed_files_count",
+            "group_task_done_tasks",
+            "group_task_done_rate",
+            "group_quality_gate_block_tasks",
+            "group_quality_gate_block_rate",
+            "group_audit_closure_ready_tasks",
+            "group_audit_closure_ready_rate",
+            "group_task_avg_cycle_ms",
+            "group_task_cycle_samples",
+        }
+        self.assertTrue(required_keys.issubset(set(kpi_overview.keys())))
+
+    def test_group_tasks_metrics_owner_filter_keeps_by_owner_scope(self) -> None:
+        _ = routes.api_group_task_create(request=self.req, body=routes.GroupTaskCreateIn(goal="metrics owner scope #1", owner_id="owner"))
+        _ = routes.api_group_task_create(request=self.req, body=routes.GroupTaskCreateIn(goal="metrics owner scope #2", owner_id="owner2"))
+
+        out = routes.api_group_tasks_metrics(request=self.req, owner_id="owner")
+        self.assertTrue(out.get("ok"))
+        metrics = dict(out.get("metrics") or {})
+
+        self.assertEqual(int(metrics.get("total") or 0), 1)
+        by_owner = list(metrics.get("by_owner") or [])
+        self.assertEqual(len(by_owner), 1)
+        self.assertEqual(str(by_owner[0].get("owner_id") or ""), "owner")
+        self.assertEqual(int(by_owner[0].get("count") or 0), 1)
+
     def test_group_task_prechecks_and_can_endpoints(self) -> None:
         created = routes.api_group_task_create(request=self.req, body=routes.GroupTaskCreateIn(goal="v2 prechecks/can", owner_id="owner"))
         task_id = str(created.get("task_id"))

@@ -2915,26 +2915,42 @@ def api_group_tasks(request: Request, limit: int = 50, status: str | None = None
 def api_group_tasks_metrics(request: Request, owner_id: str | None = None) -> dict:
     _ensure_group_mode_enabled(_get_settings(request))
     store = _get_store(request)
+    owner_v = (str(owner_id).strip() if owner_id is not None else None)
+
     fn = getattr(store, "aggregate_group_tasks", None)
     if callable(fn):
-        metrics = fn(owner_id=(str(owner_id).strip() if owner_id is not None else None))
-        return {"ok": True, "metrics": metrics}
+        metrics = fn(owner_id=owner_v)
+    else:
+        fn_list = getattr(store, "list_group_tasks", None)
+        if not callable(fn_list):
+            raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
+        rows = fn_list(limit=200, status=None, phase=None, owner_id=owner_v, cursor_updated_at_ms=None) or []
+        by_status: dict[str, int] = {}
+        by_phase: dict[str, int] = {}
+        by_owner: dict[str, int] = {}
+        for r in rows:
+            st = str(r.get("status") or "unknown")
+            ph = str(r.get("phase") or "unknown")
+            ow = str(r.get("owner_id") or "")
+            by_status[st] = int(by_status.get(st) or 0) + 1
+            by_phase[ph] = int(by_phase.get(ph) or 0) + 1
+            by_owner[ow] = int(by_owner.get(ow) or 0) + 1
+        metrics = {"total": len(rows), "by_status": by_status, "by_phase": by_phase, "by_owner": [{"owner_id": k, "count": v} for k, v in sorted(by_owner.items(), key=lambda x: (-x[1], x[0]))[:20]]}
 
-    fn_list = getattr(store, "list_group_tasks", None)
-    if not callable(fn_list):
-        raise HTTPException(status_code=500, detail={"code": "GROUP_TASK_STORAGE_NOT_SUPPORTED"})
-    rows = fn_list(limit=200, status=None, phase=None, owner_id=(str(owner_id).strip() if owner_id is not None else None), cursor_updated_at_ms=None) or []
-    by_status: dict[str, int] = {}
-    by_phase: dict[str, int] = {}
-    by_owner: dict[str, int] = {}
-    for r in rows:
-        st = str(r.get("status") or "unknown")
-        ph = str(r.get("phase") or "unknown")
-        ow = str(r.get("owner_id") or "")
-        by_status[st] = int(by_status.get(st) or 0) + 1
-        by_phase[ph] = int(by_phase.get(ph) or 0) + 1
-        by_owner[ow] = int(by_owner.get(ow) or 0) + 1
-    return {"ok": True, "metrics": {"total": len(rows), "by_status": by_status, "by_phase": by_phase, "by_owner": [{"owner_id": k, "count": v} for k, v in sorted(by_owner.items(), key=lambda x: (-x[1], x[0]))[:20]]}}
+    try:
+        kpi_overview_out = handle_group_tasks_kpi_overview(
+            owner_id=owner_v,
+            status=None,
+            phase=None,
+            list_tasks=lambda **kw: list_group_tasks_or_raise(store, **kw),
+            fetch_kpi=lambda tid: api_group_task_kpi(request, tid),
+            fetch_audit_closure=lambda tid: api_group_task_audit_closure(request, tid),
+        )
+        metrics["kpi_overview"] = dict(kpi_overview_out.get("overview") or {})
+    except HTTPException:
+        pass
+
+    return {"ok": True, "metrics": metrics}
 
 
 @router.get("/api/group/tasks/{task_id}/phase-history")
@@ -3806,6 +3822,7 @@ def api_group_tasks_kpi_overview(request: Request, owner_id: str | None = None, 
         phase=phase,
         list_tasks=lambda **kw: list_group_tasks_or_raise(store, **kw),
         fetch_kpi=lambda tid: api_group_task_kpi(request, tid),
+        fetch_audit_closure=lambda tid: api_group_task_audit_closure(request, tid),
     )
 
 

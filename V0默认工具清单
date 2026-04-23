@@ -1,0 +1,148 @@
+V0 默认工具清单（allowlist 初始版本）
+版本：V0-tools-1
+原则：只允许 risk=low 且 side_effect=false 的工具；默认不出网；默认不写文件。
+
+
+0. 全局约束（对所有工具生效）
+- 命名约束：工具名只允许 [a-zA-Z0-9_]+，全局唯一。
+- 参数约束：必须通过 json_schema 校验；未通过则拒绝执行（TOOL_ARGS_INVALID）。
+- 输出约束：ToolResult.content 必须 JSON 可序列化；推荐 object。
+- 资源约束：每个工具必须有 tool_timeout_ms（建议 10000ms）。
+- 脱敏约束：入参/出参命中 key/token/secret/password/authorization/cookie/session 一律替换为 "***"。
+
+
+1) time_now
+- 目的：提供“当前时间”给模型，用于生成带时间语义的回复或记录。
+- 风险：low
+- 副作用：false
+- 默认启用：是
+- tool_timeout_ms：1000
+- json_schema：
+  {
+    "type": "object",
+    "properties": {},
+    "required": []
+  }
+- 返回 content 示例：
+  {"unix": 1760000000, "iso": "2026-03-12T08:00:00Z"}
+
+
+2) remember
+- 目的：保存一条与当前 conversation 相关的长期笔记（V0 只做“文本笔记”）。
+- 风险：low
+- 副作用：false（仅写入本地 DB，不做外部动作）
+- 默认启用：是
+- tool_timeout_ms：2000
+- json_schema：
+  {
+    "type": "object",
+    "properties": {
+      "note": {"type": "string", "minLength": 1, "maxLength": 2000}
+    },
+    "required": ["note"]
+  }
+- 约束：
+  - note 必须是“事实/偏好/约定”的短文本，避免粘贴敏感信息。
+- 返回 content 示例：
+  {"ok": true}
+
+
+3) recall
+- 目的：读取当前 conversation 最近若干条长期笔记。
+- 风险：low
+- 副作用：false
+- 默认启用：是
+- tool_timeout_ms：2000
+- json_schema：
+  {
+    "type": "object",
+    "properties": {
+      "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+    },
+    "required": ["limit"]
+  }
+- 返回 content 示例：
+  {"notes": ["...","..."]}
+
+
+4) calc
+- 目的：做确定性的数学计算，避免模型算错。
+- 风险：low
+- 副作用：false
+- 默认启用：是
+- tool_timeout_ms：2000
+- json_schema：
+  {
+    "type": "object",
+    "properties": {
+      "expression": {"type": "string", "minLength": 1, "maxLength": 200}
+    },
+    "required": ["expression"]
+  }
+- 约束（安全边界）：
+  - 只允许：数字、空格、+ - * / ( ) . 以及幂运算符（若实现支持）。
+  - 禁止任何变量名、函数名、文件/网络相关字符；出现即拒绝（TOOL_ARGS_INVALID）。
+- 返回 content 示例：
+  {"value": 3.14159}
+
+
+5) echo
+- 目的：调试工具链是否可用（V0 开发期用；正式可保留也可移除）。
+- 风险：low
+- 副作用：false
+- 默认启用：否（建议只在开发环境启用）
+- tool_timeout_ms：1000
+- json_schema：
+  {
+    "type": "object",
+    "properties": {
+      "text": {"type": "string", "minLength": 0, "maxLength": 2000}
+    },
+    "required": ["text"]
+  }
+- 返回 content 示例：
+  {"text": "原样返回"}
+
+
+6. V0 明确禁用工具（denylist 初始版本）
+- file_write（任何写文件/改文件工具）：side_effect=true
+- http_request / web_fetch（任何外网请求工具）：默认 network_policy.allow=false
+- run_shell / exec（任何系统命令/子进程工具）：高风险
+- send_message（任何对外发送消息、群管理等工具）：高风险
+
+
+7. 工具与回放（必须记录）
+- 每次 tool_call：记录 name、call_id、arguments_json（脱敏后）
+- 每次 tool_result：记录 ok、content_json（脱敏后）、error.code（若失败）
+- 每次工具执行：必须有 tool.span（tool_name/allowed/latency_ms/ok/error_code）
+
+8. 产品侧补充（V0 必做）
+- 会话级工具开关：用户可在会话设置中关闭“允许工具调用”；关闭后 tool_choice=none。
+- 用户可见说明：每次 tool_call/tool_result 需有可读文案（调用了什么、结果是否成功）。
+- 失败提示映射：
+  - TOOL_NOT_ALLOWED -> “当前会话不允许使用该工具”
+  - TOOL_ARGS_INVALID -> “工具参数不符合要求，请重试”
+  - TOOL_TIMEOUT -> “工具执行超时，请稍后重试”
+  - TOOL_RUNTIME_ERROR -> “工具执行失败，请稍后重试”
+
+9) memory_forget（新增，V0 推荐）
+- 目的：删除当前 conversation 的一条或多条长期笔记，满足用户隐私治理。
+- 风险：low
+- 副作用：false（仅写入本地 DB，不做外部动作）
+- 默认启用：是
+- tool_timeout_ms：2000
+- json_schema：
+  {
+    "type": "object",
+    "properties": {
+      "memory_ids": {
+        "type": "array",
+        "items": {"type": "integer"},
+        "minItems": 1,
+        "maxItems": 50
+      }
+    },
+    "required": ["memory_ids"]
+  }
+- 返回 content 示例：
+  {"ok": true, "deleted": 3}
