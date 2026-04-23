@@ -284,3 +284,36 @@
 1. 阶段2：按领域拆分 `routes.py`（`group_tasks/group_kpi/group_audit/group_prechecks`）。
 2. 阶段2每次改动后执行统一回归命令，确保行为等价。
 3. 阶段3：补可视化消费、监控指标、发布SOP。
+
+
+## 23. 重构验收完成（V2 模块化拆分）
+
+### 23.1 本轮目标
+- 在不改变对外 API 行为的前提下，将 `routes.py` 中 group 相关能力按领域拆分为独立模块。
+- 目标领域：`tasks` / `kpi` / `prechecks` / `audit` / `common`。
+
+### 23.2 拆分结果
+- 主路由保留在 `apps/server/src/connectors/web/routes.py`，并改为薄封装委托。
+- 新增/落地模块：
+  - `apps/server/src/connectors/web/group_tasks_routes.py`
+  - `apps/server/src/connectors/web/group_kpi_routes.py`
+  - `apps/server/src/connectors/web/group_prechecks_routes.py`
+  - `apps/server/src/connectors/web/group_audit_routes.py`
+  - `apps/server/src/connectors/web/group_common.py`
+- 迁移原则：
+  - URL 路径不变
+  - 返回字段不变
+  - 错误码语义不变
+
+### 23.3 验收结果
+- 回归命令：
+  - `cd /Users/lixiaoyi/Documents/newtext/agunt/apps/server/src`
+  - `PYTHONWARNINGS="error::ResourceWarning" python3 -m unittest -v test_quality_gate_contract.py`
+- 结果：`Ran 44 tests ... OK`
+- 语法检查命令：
+  - `python3 -m py_compile connectors/web/routes.py connectors/web/group_tasks_routes.py connectors/web/group_kpi_routes.py connectors/web/group_prechecks_routes.py connectors/web/group_audit_routes.py connectors/web/group_common.py`
+- 结果：无输出（通过）
+
+### 23.4 结论
+- 结论：V2 后端重构拆分阶段通过验收，满足“行为等价 + 可维护性提升”目标。
+- 当前状态：可进入发布收口（commit/tag）与后续产品化外围阶段。
